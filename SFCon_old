@@ -1,5 +1,3 @@
-
-:q!
 #!/usr/bin/perl 
 ## Version$Revision: 4.14 $
 # Adding the Shared_Pool Monitoring usage in the matrices 2/25/2016 --Amit
