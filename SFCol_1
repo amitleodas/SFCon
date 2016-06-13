@@ -1,0 +1,1387 @@
+#!/usr/bin/perl 
+## Version$Revision: 4.14 $
+# Adding the Shared_Pool Monitoring usage in the matrices 2/25/2016 --Amit
+## Version$Revision: 4.13 $
+# Adding the UNDO usage in the matrices 2/1/2016  --Amit
+#
+## Version$Revision: 4.12 $
+# SF_CON
+# SF_CON generates a running report of Oracle instance statistics to quickly pinpoint database problems.
+# For usage - see below the header.
+#
+# Adding Flash Cache Data by Amit - 8/13/15
+#db flash cache single block physical read
+#db flash cache multiblock physical read
+#db flash cache write
+#write complete waits: flash cache
+#db flash cache invalidate wait
+#db flash cache dynamic disabling wait
+# physical read flash cache hits
+# flash cache inserts          
+# flash cache insert skip: exists
+# flash cache insert skip: not useful
+# flash cache insert skip: modification 
+
+
+
+use strict;
+use Getopt::Long;
+use Socket;
+use POSIX qw(uname);
+use POSIX qw(strftime);
+use Fcntl qw(:flock);
+use Digest::MD5 qw(md5 md5_hex md5_base64);
+
+#***************************************************************************************
+my $syntax=<<'EOF';
+Usage: SF_CON --sid <sid_name> [--perl <perl_home>] [--cycle <cycle_time>] 
+ [--outDir <OutputDir>] [--prefix <PREFIX>] [--config <config-file> ]
+ [--version] [--test] [--racon]  [ --notify <EMAIL>]
+ sid  - Oracle SID, mandatory parameter
+ Oracle_home will be set according to oraenv(oratab) settings.
+ perl - Perl Home. The reason we allow to specify perl home ( default will be ORACLE_HOME/perl) is that
+ DBD::Oracle (underlying libclntsh.so)  must be coupled with actual ORACLE_HOME for the database
+ we connect to. This is why, cases when multiple versions of database installed on the same host can't be
+ covered with one installation of perl.
+ Initial execution of the script is performed with whatever is available on the host, then the script changes it.:q!
+
+
+
+
+
+
+
+
+
+
+I
+ cycle -  length of one cycle of monitoring, generating new data in the log files
+ outDir  - output file dir, default:  /oracle/mgmt/SFCon
+ prefix  - output file name prefix, defaut:SF_CON (SF_CON_TEST if test mode is specified)
+ config - path to additional config file containing list of SQL for monitoring
+ test - causes replacement of standard path for output files with 'test' location
+ racon  - additional tracing to include interconnect statistics 
+ version - print version and exit
+ notify  - email for notification, dbeng@salesforce.com by default.  
+EOF
+#***************************************************************************************
+
+#****  Global variables/hashes used throughout the program
+my ($ora_sid,$ora_home,$cycle_time,$outputFilename,$configFile,$testMode,$printVersion,$rac_on, $outputdir);
+my ($perl_home, $initial_params);
+my (%newdata, %olddata, %qdata, %latches);
+my $sqlExec={};
+my $flagteng='N';
+my $ss_per_busy;
+my $disp_per_busy;
+my $logdir;
+my $config={};
+my $majorVer;
+my $date;
+my $load;
+my $NOTIF_ADDR;
+my $passwd;
+$passwd=`/oracle/mgmt/bin/orapwd.pl -u inspector`;
+
+my $pageCounter=0;
+my $cycleStart=time;
+my $cycleElapsed=0;
+my (@evntWaitArray,@evntTimeArray,@prevWaitArray,@prevTimeArray);
+my @statArray;
+ #Events
+my %delta;
+ # ADG:
+my ($MRP,$InTraf,$RTA,$LagSecs,$TLagSecs,$CkpT,$ApplyMB,$R_IO,$RFS_W,$RFS_R,$MRPStat,$TSB);
+my $activeThreads;
+my $ActiveUNDO;
+my $MaxUNDO;
+
+my ($spFlush,$sp4031);
+my ($STAT_EIDMEM,$STAT_SQLA,$STAT_PXMPool,$STAT_KGLH0, $STAT_FreMem,$STAT_KGLHD,$STAT_DBHBuckets,$STAT_GCSRes,$STAT_GCSShadow);
+ #  replaced by MTS
+ # my ($ssIdle, $ssBusy, $ssRequests);
+ # my ($dispOwned, $dispIdle, $dispBusy);
+my ($gcWait,$gcTime);
+my $activeSQLList;
+my ($ACnt, $TCnt, $MXV);
+
+#****  Parsing/handling of parameters/arguments  ***********************
+$initial_params=join ' ',@ARGV;
+print "Started with arguments: $initial_params\n";
+ GetOptions("sid=s",\$ora_sid,"perl=s",\$perl_home,"cycle=i",\$cycle_time,"outputFile=s",\$outputFilename,
+ "config=s",\$configFile,"test",\$testMode,"version",\$printVersion,"outDir=s",\$outputdir,
+ "racon",\$rac_on, "notify=s",\$NOTIF_ADDR)
+ or die "$syntax\n";
+
+ if (! defined $ora_sid  ) {
+ print "$syntax\n"; exit 0;
+ }
+ printVersion() if ($printVersion);
+ # setup output location
+ $outputdir="/oracle/mgmt/SFCon" if (! defined $outputdir);
+ mkdir $outputdir or die "Cannot create $outputdir" or die  if (! -d $outputdir);
+
+ $logdir="$outputdir/$ora_sid" if (! defined $logdir);
+ mkdir $logdir or die "Cannot create $logdir" or die if (! -d $logdir);
+ $logdir=`cd $logdir;pwd`; chomp $logdir;
+ die if (! -d $logdir);
+#setup output file name forcing it into the logs location
+ if ($testMode) {
+ $outputFilename="SF_CON_TEST" if !defined $outputFilename;
+ } else {
+ $outputFilename="SF_CON" if !defined $outputFilename;
+ }
+ $outputFilename="$logdir/$outputFilename";
+
+
+
+ if (! defined $ENV{CORRECT_ENVIRONMENT}) {
+  execute_in_correct_environment();
+  }
+  #*** below is control for SF_CON for this SID already running
+  exit 0 if (SFCON_running($ora_sid));
+
+  # Why require and why here? Because we can only load DBD when we are sure it's available.
+  require DBD::Oracle;
+
+    if ($ora_sid ne $ENV{ORACLE_SID} ) {
+    die "Mismatching parameter ora_sid ($ora_sid) and ORACLE_SID($ENV{ORACLE_SID}";
+    }
+
+    print "ORACLE_SID:$ENV{ORACLE_SID}  OHOME:$ENV{ORACLE_HOME}\n";
+
+    parseConfig($configFile,$config,$sqlExec) if (defined $configFile);
+
+# defaulting rac collection on
+$rac_on=1 if (!defined $rac_on);
+$cycle_time=10 if (!defined $cycle_time);
+$NOTIF_ADDR='dbeng@salesforce.com' if (! defined $NOTIF_ADDR);
+
+
+my $outputFilenameMain=$outputFilename.".log";
+my $outputFilenameWait=$outputFilename."_WAIT.log";
+my $outputFilenameSQL=$outputFilename."_SQL.log";
+my $outputFilenameEX=$outputFilename."_EX.log";
+my $outputFilenameLatch=$outputFilename."_LATCH.log";
+my $outputFilenameExec=$outputFilename."_EXEC.log";
+my $outputFilenameShared=$outputFilename."_SHARED.log";
+my $outputFilenameMTS=$outputFilename."_MTS.log";
+my $outputFilenameSPool=$outputFilename."_SPool.log";
+my $outputFilenameRAC=$outputFilename."_RAC.log";
+my $outputFilenameADG=$outputFilename."_ADG.log";
+my $outputFilenameFLASH=$outputFilename."_FLASH.log";
+my $outputFilenameIO=$outputFilename."_IO.log";
+
+#****  CONNECT & Parameter setup  ************************
+my $dbh=DBI->connect('DBI:Oracle:','inspector',"$passwd") or die "Can't connect to database.\n";
+ $dbh->{RaiseError}=1;
+ $dbh->{FetchHashKeyName}="NAME_lc";
+ $SIG{INT}=sub {close_files();exit};
+
+ $dbh->do("alter session set nls_date_format='mm-dd hh24:mi:ss'");
+ #$dbh->do("alter session set sql_trace=true");
+
+ #** Major version of Oracle
+ $majorVer=$dbh->selectrow_array
+ ("select to_number(substr(version,1,instr(version,'.')-1)) from v\$instance"); 
+
+ #**  get the constants for dbname and db_unique_name, we have the sid passed in
+my ($DBNm,$DBRole)=$dbh->selectrow_array("select name,substr(database_role,1,3) from v\$database");
+my $DBUQNm=$dbh->selectrow_array
+ ("select nvl((select value from v\$parameter where name='db_unique_name'), d.name) as db_unique_name from v\$database d");
+my $CPUCount=$dbh->selectrow_array("select value from v\$parameter where name='cpu_count'");
+#my ($ActiveUNDO,$MaxUNDO)=$dbh->selectrow_array("select nvl(sum(used_ublk),0)*8/1024, nvl(max(used_ublk),0)*8/1024 from v\$transaction");
+#my ($ActUNDO)=$dbh->selectrow_array("select nvl)round((sum(bytes)/1024/1024/1024),2) from dba_undo_extents where tablespace_name in (select value from v$parameter where name='undo_tablespace') and status='ACTIVE'");
+
+#**** Declare the constants for Oracle statistic numbers  *********************
+my ($STAT_CGET, $STAT_BGET, $STAT_PREAD, $STAT_TPREAD, $STAT_RIOPS, $STAT_BYT_OUT, $STAT_EXEC, $STAT_FBR);
+my ($STAT_FBI, $STAT_DBI, $STAT_PWRITE, $STAT_TEMPB, $STAT_TPWRITE, $STAT_WIOPS, $STAT_LOGON, $STAT_CPU, $STAT_REDO, $STAT_UNDO);
+my ($STAT_SCAN, $STAT_CCHG, $STAT_PARSE_TOTAL, $STAT_PARSE_HARD,$STAT_PARSE_CPU);
+my ($STAT_PARSE_ELA,$STAT_CALLS,$STAT_COMMITS,$STAT_ROLLBACKS,$WAIT_LC_PIN,$WAIT_LC_LOCK);
+my ($WAIT_LF, $WAIT_SEQREAD, $WAIT_BBW,$WAIT_ENQ,$WAIT_ENQ_TM,$WAIT_ENQ_TX_ROW,$WAIT_ENQ_TX_ITL,$WAIT_ENQ_TX_IND);
+my ($WAIT_PMON,$WAIT_IPC,$WAIT_SMON,$WAIT_SQLNET,$WAIT_PX_IDLE); # Idle events.
+ #my ($GC_CR_BLOCKS_SERVED, $GC_CR_BLOCKS_RECEIVED, $GC_CUR_BLOCKS_SERVED, $GC_CUR_BLOCKS_RECEIVED); #RAC events.
+my ($GC_CR_BLOCKS_SERVED,$GC_CR_BLOCKS_SERVED_TIME,$GC_CR_BLOCKS_RECEIVED,$GC_CR_BLOCKS_RECEIVED_TIME,$GC_CUR_BLOCKS_SERVED,$GC_CUR_BLOCKS_SERVED_TIME,$GC_CUR_BLOCKS_RECEIVED,$GC_CUR_BLOCKS_RECEIVED_TIME,$GC_CR_MSG,$GC_Enq_MSG); #RAC events
+ 
+my ($STAT_PGA, $STAT_BLOCK_CHANGE, $STAT_PWRITE_NONCHK, $STAT_CR_BLOCKS_CREATED,
+ $STAT_CR_BLOCKS_CONVERTED, $STAT_BG_CKPT_START, $STAT_BG_CKPT_DONE, $STAT_ROWS_FTS,
+ $STAT_ROWS_ROWID, $STAT_CHAINED_ROWS, $STAT_LEAF_SPLIT, $STAT_SORT_MEM, $STAT_SORT_DISK,
+ $STAT_CURSOR_CACHE, $WAIT_LFS, $WAIT_FREE_BUF, $WAIT_LGF_PWRITE, $WAIT_DBF_SCAT_RD,
+ $WAIT_DBF_PWRITE, $WAIT_DIR_READ, $WAIT_DIR_WRITE, $WAIT_NET_RESET);
+
+my ($STAT_PRFCH, $STAT_FCI, $WAIT_FCSBPR, $WAIT_FCMBPR, $WAIT_FCW, $WAIT_WCWFC, $WAIT_FCIW, $WAIT_FCDDW);  #Flash Cache Event
+
+my ($WAIT_SEQREAD, $WAIT_LGF_PWRITE, $WAIT_DBF_SCAT_RD, $WAIT_DIR_READ);
+ load_stat_numbers();
+
+#****  Prepare queries that are going to be used on each iteration
+# Any access to v$sysstat is a full-table scan. Thus, it's better to go through once and get the whole table than to get
+# individual rows, even though we only use a few of the rows.
+my $statStmt=$dbh->prepare('select statistic#,value from v$sysstat');
+ #*************
+ # This statement gets the data for the v$system_event view. It doesn't get the names that show up in v$system_event,
+ # but it avoids a join. Instead, we get numbers that are not normally visible.
+ # To see what numbers are for what events, do "select  indx,kslednam from x$ksled".
+ # First column is index number, second column is the total number of waits, the third is the total time waited.
+my $evntStmt;
+ # Used to be =$dbh->prepare('select indx,ksleswts_fg+ksleswts_bg,kslestim_fg + kslestim_bg from x$kslei');
+ if ($majorVer==9) {
+ $evntStmt=$dbh->prepare('select indx,ksleswts,kslestim from x$kslei');
+ } elsif ($majorVer==10) {
+ $dbh->do("alter session set optimizer_features_enable='9.2.0'"); #use_concat hint won't work with 10g optimizer.
+ $evntStmt=$dbh->prepare("select /*+use_concat */ indx,ksleswts,kslestim from x\$kslei");
+ } else { # 11g
+ $dbh->do("alter session set optimizer_features_enable='9.2.0'"); #for now, use this with 11g also
+ $evntStmt=$dbh->prepare("select /*+use_concat */ indx,ksleswts_un+ksleswts_fg+ksleswts_bg,
+  kslestim_un+kslestim_fg+kslestim_bg from x\$kslei");
+ }
+  #*************
+  # This statement gets latch number, gets, misses, and sleeps from x$ksllt. This is the same information that
+  # you would get from v$latch, except we avoid a join that gets the latch name.
+ my $latchStmt=$dbh->prepare('select latch#,sum(gets),sum(misses), sum(sleeps) from V$latch group by latch#');
+  #*************
+ my $activeThreadStmt=$dbh->prepare (qq(select sql_hash_value,count(*) 
+      from v\$session where status='ACTIVE' and type<>'BACKGROUND'
+          group by sql_hash_value order by count(*) desc));
+ my $pqServersBusyStmt=$dbh->prepare('select value 
+      from v$pq_sysstat where statistic=\'Servers Busy%\'');
+
+ my $sharedPoolStmt=$dbh->prepare('select nvl(sum(kghlufsh),0), nvl(sum(kghlunfu),0) from x$kghlu');
+# my $sharedPoolStatement=$dbh->prepare('select round(bytes/1024/1024) from v$sgastat  where pool=\'shared pool\' and  name in (\'Execution ID memory\',\'SQLA\',\'PX msg pool\',\'KGLH0\',\'free memory\',\'KGLHD\',\'db_block_hash_buckets\',\'gcs resources\',\'gcs shadows\')');
+
+
+ my $sqlExecStmt=$dbh->prepare('select nvl(sum(executions),0),nvl(sum(buffer_gets),0) from v$sql where hash_value=?');
+
+    #  OBSOLETED- replaced by MTS
+    # my $sqlSharedServerStmt=$dbh->prepare(
+    #  'select nvl(sum(idle),0), nvl(sum(busy),0), nvl(sum(requests),0) from v$shared_server');
+    #my $sqlDispatcherStmt=$dbh->prepare(
+    #  'select nvl(sum(owned),0), nvl(sum(idle),0), nvl(sum(busy),0) from v$dispatcher');
+    
+    #MTS:
+    # Total shared servers, busy shared servers
+   my $mtsSharedServerStmt=$dbh->prepare(qq(select count(*),nvl(sum(case when status='WAIT(COMMON)' then 0 else 1 end),0)
+      from v\$shared_server));
+
+   my $mtsDispatcherStmt=$dbh->prepare('select sum(created),sum(owned),sum(busy),sum(idle),sum(bytes),count(*) from v$dispatcher');
+
+  my $mtsQueueStmt=$dbh->prepare("select 
+   nvl(sum(case when type='COMMON' then queued else 0 end),0) common_depth,
+   nvl(sum(case when type='COMMON' then wait else 0 end),0) common_wait,
+   nvl(sum(case when type='COMMON' then totalq else 0 end),0) common_totalq,
+   nvl(sum(case when type='DISPATCHER' then queued else 0 end),0) dispatcher_depth,
+   nvl(sum(case when type='DISPATCHER' then wait else 0 end),0) dispatcher_wait,
+   nvl(sum(case when type='DISPATCHER' then totalq else 0 end),0) dispatcher_totalq 
+   from v\$queue");
+
+  my $sqlQueueStmt=$dbh->prepare(
+   q(select type, nvl(sum(queued),0), nvl(sum(wait),0), nvl(sum(totalq),0) 
+   from 
+   (select type, queued, wait, totalq from v$queue
+   union select 'COMMON',0,0,0 from dual
+   union select 'DISPATCHER',0,0,0 from dual ) group by type));
+  my $sqlRACStmt="";
+   if ($majorVer >= 10) {
+   if ($rac_on) {
+   $sqlRACStmt=$dbh->prepare("select nvl(sum(TOTAL_WAITS),0), nvl(sum(TIME_WAITED),0) from v\$system_event where WAIT_CLASS='Cluster'");
+      } 
+  }
+
+
+
+#************************************************************************************************************
+#**** Starting main loop, scanning dictionary periodically
+#************************************************************************************************************
+while (1) {
+ open_output();
+ if (!($pageCounter++%24)) { 
+ print_headers();
+ }
+ collect_sysstat();
+ collect_events();
+ collect_sql();
+ collect_latch();
+ collect_queue();
+ collect_ADG();
+ #collect_FLASH();
+ collect_activeThreads();
+ collect_MTS();
+ collect_SPool();
+ ($spFlush,$sp4031)=$dbh->selectrow_array($sharedPoolStmt);
+# ($STAT_EIDMEM,$STAT_SQLA,$STAT_PXMPool,$STAT_KGLH0, $STAT_FreMem,$STAT_KGLHD,$STAT_DBHBuckets,$STAT_GCSRes,$STAT_GCSShadow)=$dbh->selectrow_array($SharedPoolStatement);
+#  OBSOLETED - SHARED  ($ssIdle, $ssBusy, $ssRequests)=$dbh->selectrow_array($sqlSharedServerStmt);
+ #    ($dispOwned, $dispIdle, $dispBusy) = $dbh->selectrow_array($sqlDispatcherStmt);
+ if ($rac_on) {
+ ($gcWait,$gcTime) = $dbh->selectrow_array($sqlRACStmt) ;
+ }
+
+# Get all the main report data
+ pick_stats();
+
+ $date = strftime("%Y-%m-%d %H:%M:%S", localtime(time)); 
+
+ $load=`uptime`;
+ $load=$1 if($load=~m/^.*load average: ([0-9]*.[0-9]*).*/);
+ 
+ set_old2new() if (!%olddata);
+ print_mainFile();
+ print_waitFile();
+ print_latchFile();
+ print_execFile();
+ print_sqlFile();
+ print_exFile();
+ #print_sharedFile();
+ print_RACFile() if ($rac_on);
+ print_ADGFile();
+ print_FLASHFile();
+ print_IOFile();
+ print_MTSFile();
+ $cycleElapsed=time-$cycleStart;
+
+ #  print MAIN_FILE "DEBUG: last cycle took $cycleElapsed seconds\n";
+  if ($cycleElapsed>$cycle_time) {
+  print MAIN_FILE "WARNING: last cycle took $cycleElapsed seconds, longer than $cycle_time second interval\n" ;
+  } else {
+  sleep($cycle_time-$cycleElapsed);
+  }
+  $cycleStart=time;
+  %olddata=%newdata; #Move current data to old data for next set of deltas.
+  foreach my $hash (keys %{$sqlExec})  {
+  $sqlExec->{$hash}->{execs_old}=$sqlExec->{$hash}->{execs};
+  $sqlExec->{$hash}->{gets_old}=$sqlExec->{$hash}->{gets};
+  }
+  @prevWaitArray=@evntWaitArray;
+  @prevTimeArray=@evntTimeArray;
+}
+#**********************************************************************************
+#******  End of the story, procedures are below
+#**********************************************************************************
+ sub close_files {
+ close(MAIN_FILE);
+ close(WAIT_FILE);
+ close(SQL_FILE);
+ close(EX_FILE);
+ close(LATCH_FILE);
+ close(EXEC_FILE);
+ #close(SHARED_FILE);
+ close(RAC_FILE) if ($rac_on);
+ close(ADG_FILE);
+ close(FLASH_FILE);
+ close(IO_FILE);
+ close(MTS_FILE);
+ close(SPool_FILE);
+}
+sub open_output {
+ if (fileno(MAIN_FILE)) {
+my @fs = stat(MAIN_FILE);
+ if ($fs[7]>30000000) {
+ close_files();
+ rename ("$outputFilenameMain.1","$outputFilenameMain.2");
+ rename ("$outputFilenameMain","$outputFilenameMain.1");
+ rename ("$outputFilenameWait.1","$outputFilenameWait.2");
+ rename ("$outputFilenameWait","$outputFilenameWait.1");
+ rename ("$outputFilenameSQL.1","$outputFilenameSQL.2");
+ rename ("$outputFilenameSQL","$outputFilenameSQL.1");
+ rename ("$outputFilenameEX.1","$outputFilenameEX.2");
+ rename ("$outputFilenameEX","$outputFilenameEX.1");
+ rename ("$outputFilenameLatch.1","$outputFilenameLatch.2");
+ rename ("$outputFilenameLatch","$outputFilenameLatch.1");
+ rename ("$outputFilenameExec.1","$outputFilenameExec.2");
+ rename ("$outputFilenameExec","$outputFilenameExec.1");
+ #rename ("$outputFilenameShared.1","$outputFilenameShared.2");
+ #rename ("$outputFilenameShared","$outputFilenameShared.1");
+ rename ("$outputFilenameRAC.1","$outputFilenameRAC.2") if ($rac_on);
+ rename ("$outputFilenameRAC","$outputFilenameRAC.1") if ($rac_on);
+ rename ("$outputFilenameADG.1","$outputFilenameADG.2");
+ rename ("$outputFilenameADG","$outputFilenameADG.1");
+ rename ("$outputFilenameFLASH.1","$outputFilenameFLASH.2");
+ rename ("$outputFilenameFLASH","$outputFilenameFLASH.1");
+ rename ("$outputFilenameIO.1","$outputFilenameIO.2");
+ rename ("$outputFilenameIO","$outputFilenameIO.1");
+ rename ("$outputFilenameMTS.1","$outputFilenameMTS.2");
+ rename ("$outputFilenameMTS","$outputFilenameMTS.1");
+ rename ("$outputFilenameSPool.1","$outputFilenameSPool.2");
+ rename ("$outputFilenameSPool","$outputFilenameSPool.1");
+
+ # and exit now, cron will restart it but meanwhile it will mean when new versions
+ # are pushed we don;t have to manually restart
+   exit;
+
+  } else {
+  return;
+ }
+}
+ open MAIN_FILE,">> $outputFilenameMain" or die "SF_CON: can't open output file $outputFilenameMain: $!\n";
+ #flock MAIN_FILE,6 or die "Can't lock $outputFilenameMain";
+ open WAIT_FILE,">> $outputFilenameWait" or die "SF_CON: can't open output file $outputFilenameWait: $!\n";
+ open SQL_FILE,">> $outputFilenameSQL" or die "SF_CON: can't open output file $outputFilenameSQL: $!\n";
+ open EX_FILE,">> $outputFilenameEX" or die "SF_CON: can't open output file $outputFilenameEX: $!\n";
+ open LATCH_FILE,">> $outputFilenameLatch" or die "SF_CON: can't open output file $outputFilenameLatch: $!\n";
+ open EXEC_FILE,">> $outputFilenameExec" or die "SF_CON: can't open output file $outputFilenameExec: $!\n";
+ # open SHARED_FILE,">> $outputFilenameShared" or die "SF_CON: can't open output file $outputFilenameShared: $!\n";
+ if ($rac_on) {open RAC_FILE,">>$outputFilenameRAC" or die "SF_CON2: can't open output file $outputFilenameRAC: $!\n" }
+ open ADG_FILE,">> $outputFilenameADG" or die "SF_CON: can't open output file $outputFilenameADG: $!\n";
+ open FLASH_FILE,">> $outputFilenameFLASH" or die "SF_CON: can't open output file $outputFilenameFLASH: $!\n";
+ open IO_FILE,">> $outputFilenameIO" or die "SF_CON: can't open output file $outputFilenameIO: $!\n";
+ open MTS_FILE,">> $outputFilenameMTS" or die "SF_CON: can't open output file $outputFilenameMTS: $!\n";
+ open SPool_FILE,">> $outputFilenameSPool" or die "SF_CON: can't open output file $outputFilenameSPool: $!\n";
+
+
+ my $oldfh = select(MAIN_FILE); $| = 1; select($oldfh);
+ $oldfh = select(WAIT_FILE); $| = 1; select($oldfh);
+ $oldfh = select(SQL_FILE); $| = 1; select($oldfh);
+ $oldfh = select(EX_FILE); $| = 1; select($oldfh);
+ $oldfh = select(LATCH_FILE); $| = 1; select($oldfh);
+ $oldfh = select(EXEC_FILE); $| = 1; select($oldfh);
+ #$oldfh = select(SHARED_FILE); $| = 1; select($oldfh);
+ if ($rac_on) {$oldfh = select(RAC_FILE); $| = 1; select($oldfh); }
+ $oldfh = select(ADG_FILE); $| = 1; select($oldfh);
+ $oldfh = select(FLASH_FILE); $| = 1; select($oldfh);
+ $oldfh = select(IO_FILE); $| = 1; select($oldfh);
+ $oldfh = select(MTS_FILE); $| = 1; select($oldfh);
+ $oldfh = select(SPool_FILE); $| = 1; select($oldfh);
+}
+sub formatDate {
+my $tmTime=shift;
+my ($sec,$min,$hour,$day,$mon,$year)=localtime($tmTime);
+my $dateStr=sprintf "%02d-%02d-%04d %02d:%02d:%02d",$day,$mon+1,$year+1900,$hour,$min,$sec;
+ return ($dateStr);
+}
+sub formatDateShort {
+my $tmTime=shift;
+my ($sec,$min,$hour,$day,$mon,$year)=localtime($tmTime);
+my $dateStr=sprintf "%02d-%02d %02d:%02d:%02d",$mon+1,$day,$hour,$min,$sec;
+ return ($dateStr);
+}
+sub formatTime {
+my $tmTime=shift;
+my ($sec,$min,$hour,$day,$mon,$year)=localtime($tmTime);
+my $dateStr=sprintf "%02d:%02d:%02d.00",$hour,$min,$sec;
+ return ($dateStr);
+}
+
+
+sub load_stat_numbers {
+ # This procedure is necessary because the statistic and event numbers change in every version of Oracle.
+ # So, we have to query v$statname and v$event_name to get the numbers.
+my $statHashRef=$dbh->selectall_hashref("select statistic# statnum,name from v\$statname","name");
+my $eventHashRef=$dbh->selectall_hashref("select event# eventnum,name from v\$event_name","name");
+ $STAT_CGET=getStat($statHashRef,"consistent gets");
+ $STAT_BGET=getStat($statHashRef,"db block gets");
+ $STAT_PREAD=getStat($statHashRef,"physical reads");
+ $STAT_TPREAD=getStat($statHashRef,"physical read total bytes");
+ $STAT_RIOPS=getStat($statHashRef,"physical read total IO requests");
+ $STAT_BYT_OUT=getStat($statHashRef,"bytes sent via SQL*Net to client");
+ $STAT_EXEC=getStat($statHashRef,"execute count");
+ $STAT_FBR=getStat($statHashRef,"free buffer requested");
+ $STAT_DBI=getStat($statHashRef,"dirty buffers inspected");
+ $STAT_FBI=getStat($statHashRef,"free buffer inspected");
+ $STAT_PWRITE=getStat($statHashRef,"physical writes");
+ $STAT_TEMPB=getStat($statHashRef,"sorts (disk)");
+ $STAT_TPWRITE=getStat($statHashRef,"physical write total bytes");
+ $STAT_WIOPS=getStat($statHashRef,"physical write total IO requests");
+ $STAT_LOGON=getStat($statHashRef,"logons cumulative");
+ $STAT_CPU=getStat($statHashRef,"CPU used by this session");
+ $STAT_REDO=getStat($statHashRef,"redo blocks written");
+ $STAT_UNDO=getStat($statHashRef,"DBWR undo block writes");
+ $WAIT_FCSBPR=getEvent($eventHashRef,"db flash cache single block physical read");
+ $WAIT_FCMBPR=getEvent($eventHashRef,"db flash cache multiblock physical read");
+ $WAIT_FCW=getEvent($eventHashRef,"db flash cache write");
+ $WAIT_WCWFC=getEvent($eventHashRef,"write complete waits: flash cache");
+ $WAIT_FCIW=getEvent($eventHashRef,"db flash cache invalidate wait");
+ $WAIT_FCDDW=getEvent($eventHashRef,"db flash cache dynamic disabling wait");
+ $STAT_PRFCH=getStat($statHashRef,"physical read flash cache hits");
+ $STAT_FCI=getStat($statHashRef,"flash cache inserts");
+
+
+if ($majorVer >= 10) {
+ $STAT_SCAN=0;
+ $flagteng='Y';
+ } else {
+ $STAT_SCAN=getStat($statHashRef,"DBWR buffers scanned");
+ }
+ $STAT_CCHG=getStat($statHashRef,"consistent changes");
+ $STAT_PARSE_TOTAL=getStat($statHashRef,"parse count (total)");
+ $STAT_PARSE_HARD=getStat($statHashRef,"parse count (hard)");
+ $STAT_CALLS=getStat($statHashRef,"user calls");
+ $STAT_COMMITS=getStat($statHashRef,"user commits");
+ $STAT_ROLLBACKS=getStat($statHashRef,"user rollbacks");
+ $STAT_PARSE_CPU=getStat($statHashRef,"parse time cpu"); 
+ $STAT_PARSE_ELA=getStat($statHashRef,"parse time elapsed");
+ $STAT_PGA=getStat($statHashRef,"session pga memory max");
+ $STAT_BLOCK_CHANGE=getStat($statHashRef,"db block changes");
+ $STAT_PWRITE_NONCHK=getStat($statHashRef,"physical writes non checkpoint");
+ $STAT_CR_BLOCKS_CREATED=getStat($statHashRef,"CR blocks created");
+ $STAT_CR_BLOCKS_CONVERTED=getStat($statHashRef,"current blocks converted for CR");
+ $STAT_BG_CKPT_START=getStat($statHashRef,"background checkpoints started");
+ $STAT_BG_CKPT_DONE=getStat($statHashRef,"background checkpoints completed");
+ $STAT_ROWS_FTS=getStat($statHashRef,"table scan rows gotten");
+ $STAT_ROWS_ROWID=getStat($statHashRef,"table fetch by rowid");
+ $STAT_CHAINED_ROWS=getStat($statHashRef,"table fetch continued row");
+ $STAT_LEAF_SPLIT=getStat($statHashRef,"leaf node splits");
+ $STAT_SORT_MEM=getStat($statHashRef,"sorts (memory)");
+ $STAT_SORT_DISK=getStat($statHashRef,"sorts (disk)");
+ $STAT_CURSOR_CACHE=getStat($statHashRef,"session cursor cache hits");
+ $WAIT_LF=getEvent($eventHashRef,"latch free");
+ $WAIT_SEQREAD=getEvent($eventHashRef,"db file sequential read");
+ $WAIT_BBW=getEvent($eventHashRef,"buffer busy waits");
+ if ($majorVer >= 10) {
+ $WAIT_ENQ=getEvent($eventHashRef, "enq: TX - row lock contention"); 
+ $WAIT_ENQ_TM=getEvent($eventHashRef,  "enq: TM - contention");
+ $WAIT_ENQ_TX_IND=getEvent($eventHashRef,"enq: TX - index contention");
+ $WAIT_ENQ_TX_ITL=getEvent($eventHashRef,"enq: TX - allocate ITL entry");
+ $WAIT_ENQ_TX_ROW=getEvent($eventHashRef,"enq: TX - row lock contention");
+ } else {
+   $WAIT_ENQ=getEvent($eventHashRef,"enqueue");  
+   }
+ $WAIT_LC_PIN=getEvent($eventHashRef,"library cache pin");
+ $WAIT_LC_LOCK=getEvent($eventHashRef,"library cache lock");
+ $WAIT_PMON=getEvent($eventHashRef,"pmon timer");
+ $WAIT_IPC=getEvent($eventHashRef,"rdbms ipc message");
+ $WAIT_SMON=getEvent($eventHashRef,"smon timer");
+ $WAIT_SQLNET=getEvent($eventHashRef,"SQL*Net message from client");
+ $WAIT_PX_IDLE=getEvent($eventHashRef,"PX Idle Wait");
+ $WAIT_LFS=getEvent($eventHashRef,"log file sync");
+ $WAIT_FREE_BUF=getEvent($eventHashRef,"free buffer waits");
+ $WAIT_LGF_PWRITE=getEvent($eventHashRef,"log file parallel write");
+ $WAIT_DBF_SCAT_RD=getEvent($eventHashRef,"db file scattered read");
+ $WAIT_DBF_PWRITE=getEvent($eventHashRef,"db file parallel write");
+ $WAIT_DIR_READ=getEvent($eventHashRef,"direct path read");
+ $WAIT_DIR_WRITE=getEvent($eventHashRef,"direct path write");
+ $WAIT_NET_RESET=getEvent($eventHashRef,"SQL*Net break/reset to client");
+
+
+ ##RAC Cluster waits##
+ if ($majorVer >= 10) {
+   if ( $rac_on ) {
+# $GC_CR_BLOCKS_SERVED=getStat($statHashRef,"gc cr blocks served");;
+# $GC_CR_BLOCKS_RECEIVED=getStat($statHashRef,"gc cr blocks received");
+# $GC_CUR_BLOCKS_SERVED=getStat($statHashRef,"gc current blocks served");
+# $GC_CUR_BLOCKS_RECEIVED=getStat($statHashRef,"gc current blocks received");
+  $GC_CR_BLOCKS_SERVED=getStat($statHashRef,"gc cr blocks served");
+  $GC_CR_BLOCKS_SERVED_TIME=getStat($statHashRef,"gc cr block send time");
+  $GC_CR_BLOCKS_RECEIVED=getStat($statHashRef,"gc cr blocks received");
+  $GC_CR_BLOCKS_RECEIVED_TIME=getStat($statHashRef,"gc cr block receive time");
+  $GC_CUR_BLOCKS_SERVED=getStat($statHashRef,"gc current blocks served");
+  $GC_CUR_BLOCKS_SERVED_TIME=getStat($statHashRef,"gc current block send time");
+  $GC_CUR_BLOCKS_RECEIVED=getStat($statHashRef,"gc current blocks received");
+  $GC_CUR_BLOCKS_RECEIVED_TIME=getStat($statHashRef,"gc current block receive time");
+  $GC_CR_MSG=getStat($statHashRef,"gcs messages sent");
+  $GC_Enq_MSG=getStat($statHashRef,"ges messages sent");
+    }
+  }
+
+ return;
+} 
+
+
+sub getStat {
+my ($statHashRef,$statName)=@_;
+my $statNum=$statHashRef->{$statName}->{statnum};
+ die "Required stat $statName not found in v\$statname" if !defined $statNum;
+ return $statNum;
+}
+
+sub getEventList {
+my $eventRef;
+ if ($majorVer==9) {
+$eventRef=$dbh->selectcol_arrayref("select event# from v\$event_name");
+ } else  {
+ $eventRef=$dbh->selectcol_arrayref("select event# from v\$event_name where name not in 
+ (select event from stats\$idle_event)
+ and wait_class <> 'Cluster' and name not like 'Backup: sbt%' and name not like 'ARCH%'");
+}
+my $eventList=join(",",@$eventRef);
+return $eventList;
+}
+
+sub getEvent {
+my ($eventHashRef,$eventName)=@_;
+my $eventNum=$eventHashRef->{$eventName}->{eventnum};
+ die "Required event $eventName not found in v\$event_name" if !defined $eventNum;
+ return $eventNum;
+}
+
+sub getLatchFreeEvents {
+my $eventRef=$dbh->selectcol_arrayref("select event# from v\$event_name where name like 'latch:%' or name='latch free'");
+my $eventList=join(",",@$eventRef);
+ return $eventList;
+}
+
+sub getEnqueueEvents {
+ #Note: name='enqueue' is only for 9i compatibility; it can be removed once 9i is gone.
+my $eventRef=$dbh->selectcol_arrayref("select event# from v\$event_name where name like 'enq:%' or name='enqueue'");
+my $eventList=join(",",@$eventRef);
+ return $eventList;
+}
+
+sub getBBWEvents {
+my $eventRef=$dbh->selectcol_arrayref
+ ("select event# from v\$event_name where name = 'buffer busy waits' or name='read by other session'");
+my $eventList=join(",",@$eventRef);
+ return $eventList;
+}
+
+sub getEventGroupTime {
+my $eventList=shift;
+my $totalTime=0;
+ foreach my $eventNum (split /,/,$eventList) {
+ $totalTime+=$evntTimeArray[$eventNum];
+ }
+ return $totalTime;
+}
+
+sub getEventGroupCount {
+my $eventList=shift;
+my $totalCount=0;
+ foreach my $eventNum (split /,/,$eventList) {
+ $totalCount+=$evntWaitArray[$eventNum];
+ }
+ return $totalCount;
+}
+
+sub parseConfig($$$) {
+my $configFile=shift;
+my $config=shift;
+my $sqlExec=shift;
+ open CONFIG,$configFile or die "Can't open config file: $!\n";
+ while (<CONFIG>) {
+my ($option, $value)=split /=/;
+ if ($option eq 'sqlexec') {
+$config->{SQLEXEC}={};
+ foreach my $sqlPair (split /,/,$value) {
+my ($hash,$title)=split /:/,$sqlPair;
+   chomp($title);
+   $config->{SQLEXEC}->{$hash}=$title;
+   $sqlExec->{$hash}={}; # set up storage for the actual values
+    }
+   next;
+    }
+   # Additional config options go here
+   warn "Unknown config option $option $value found\n";
+    }
+  #foreach my $sqlHash (keys %{$config->{SQLEXEC}}) { -- Only this line commened Deva
+#  printf "DEBUG CONFIG: $sqlHash: %s\n",$config->{SQLEXEC}->{$sqlHash};
+#  }
+}
+sub printVersion {
+ open(SELF,"<$0") or die;
+my $foo=<SELF>;
+ $foo=<SELF>;
+ print $foo;
+ exit;
+}
+#sub print_headers {
+# print MAIN_FILE "   CGet BGet PhyR  Sent  Execs  FBReq BuIns Parse Writes  ";
+# print MAIN_FILE "BrBW Load Log  CPU LF DBF PQ ACT  REDO_MB_Sec Scan EnQ\n";
+# print EX_FILE "    LcWT  HP SParse  PC  PE  Calls Comit Flush 4031\n";
+#  print SHARED_FILE "   Requests SSUtil Conn DispUtil SQ DQ SQWait DQWait\n";
+# print MTS_FILE "    Tot Busy  MTS MTS Disp Comm Disp Comm Disp\n";
+# print MTS_FILE "   SS SS  Log  Sess Busy Dpth Dpth Time Time\n";
+#
+# print ADG_FILE "Date Time DBNm  DBUQNm   DBInst Role ACnt TCnt MXV".
+# " MRP InTrf RTA LagS TLagS CkpT AlyMB R_IO RFS_W RFS_R MStat T:S:B\n";
+# #print RAC_FILE "   GCWaits GCTime BlkServ BlkRecv\n" if($rac_on);
+# print RAC_FILE "   GCWaits GCTime  CRBSrv  CurBSrv  CRBRcv  CRBRTm_ms  CurBRcv CurBRTm_ms GC_CR_Msg  GC_Enq_Msg Execs CPU \n" if($rac_on);
+# print EXEC_FILE "   ";
+# foreach my $sqlHash (sort keys %{$config->{SQLEXEC}}) {
+# printf EXEC_FILE "%15s ",$config->{SQLEXEC}->{$sqlHash};
+# }
+#print EXEC_FILE "\n";
+#}
+# ($newdata{CGET}-$olddata{CGET})/1000/$cycle_time,
+# ($newdata{DBGET}-$olddata{DBGET})/1000/$cycle_time,
+# ($newdata{TREADS}-$olddata{TREADS})/1000/$cycle_time,
+# ($newdata{READS}-$olddata{READS})*8/1000/$cycle_time,
+# ($newdata{RIOPS}-$olddata{RIOPS})/$cycle_time,
+# ($newdata{TWRITES}-$olddata{TWRITES})/1000/$cycle_time,
+# ($newdata{WRITES}-$olddata{WRITES})*8/1000/$cycle_time,
+# ($newdata{WIOPS}-$olddata{WIOPS})/1000/$cycle_time,
+# ($newdata{SENT}-$olddata{SENT})/1000000/$cycle_time,
+# ($newdata{EXEC}-$olddata{EXEC})/$cycle_time,
+# ($newdata{PARSE_HARD}-$olddata{PARSE_HARD})/$cycle_time,
+# ((($newdata{PARSE_TOTAL}-$olddata{PARSE_TOTAL})-($newdata{PARSE_HARD}-$olddata{PARSE_HARD})))/$cycle_time,
+# $load,
+# ($newdata{LOGONS}-$olddata{LOGONS})/$cycle_time,
+# ($newdata{CPU}-$olddata{CPU})/$CPUCount/$cycle_time,
+# ($newdata{DBF_TIME}-$olddata{DBF_TIME})/1000/$cycle_time,
+# $newdata{ACT},
+# ($newdata{REDO}-$olddata{REDO})/2048/$cycle_time,
+# ($newdata{UNDO}-$olddata{UNDO})*8/1024/$cycle_time,
+# $newdata{ENQ_CNT}-$olddata{ENQ_CNT};
+#
+sub print_headers {
+  print MAIN_FILE "                     BGets    CGets  APhyR  RIops  Writs WIops  Net0  IntrC  Execs HPrse  SPrse  ";
+  print MAIN_FILE " Load  Log  CPU%  Dfsr    Lfs   ACT  REDO  UNDO Cmmt Rlbk  EnQ\n";
+  print EX_FILE "                    LcWT  HP SParse  PC  PE  Calls Comit Flush 4031\n";
+  #  print SHARED_FILE "                   Requests SSUtil Conn DispUtil SQ DQ SQWait DQWait\n";
+  print MTS_FILE "                      Tot Busy  MTS   MTS Disp Comm Disp Comm Disp\n";
+  print MTS_FILE "                       SS   SS  Log  Sess Busy Dpth Dpth Time Time\n";
+
+  print ADG_FILE "Date       Time     DBNm    DBUQNm           DBInst   Role ACnt TCnt MXV".
+                 "   MRP InTrf RTA LagS TLagS CkpT AlyMB R_IO RFS_W RFS_R MStat T:S:B\n";
+
+  print FLASH_FILE "Date       Time      FCPreadVol  FCPreadPerf PreadFCHit FCInsert dFCWrite  wcWaitFC  dFCInvalW   dFCdisw\n";
+  print IO_FILE "Date          Time    TPhyRd  APhyR RIOPS   TPhyW  APhyW WIOPS TIOPS DfSRCn  Dfsr TSctRCn TSctR TDprCt   Dpr TLfsCt   Lfs LfpwCt Lfpw  REDOMB ActUNDO UnXUNDO ExUNDO TEMPMB\n";
+
+  #print RAC_FILE "                   GCWaits GCTime BlkServ BlkRecv\n" if($rac_on);
+   print RAC_FILE "                   GCWaits GCTime  CRtx  CRrx   ActBtx    ActBrx   CRRx_ms   ActBRx_ms   GC_CR_Msg  GC_Enq_Msg     Total_MB      Execs   CPU% ACT\n" if($rac_on);
+   print EXEC_FILE "               ";
+   foreach my $sqlHash (sort keys %{$config->{SQLEXEC}}) {
+   printf EXEC_FILE "%15s ",$config->{SQLEXEC}->{$sqlHash};
+  }
+   print EXEC_FILE "\n";
+}
+
+
+sub collect_sysstat {
+ #****  Load the entire contents of v$sysstat (more efficient than getting items one by one)
+ #**********************************************************
+my $statRef=$dbh->selectall_arrayref($statStmt);
+my $stat;
+ foreach $stat (@$statRef) {
+ $statArray[$$stat[0]]=$$stat[1];
+ }
+}
+sub collect_events {
+ #****  Load the contents of x$kslei, underlying table for v$system_event
+ #**********************************************************
+my $eventRef=$dbh->selectall_arrayref($evntStmt);
+my ($evnt,$evntNo);
+ foreach $evnt (@$eventRef) {
+ $evntWaitArray[$$evnt[0]]=$$evnt[1];
+ $evntTimeArray[$$evnt[0]]=$$evnt[2];
+ }
+ if (!@prevWaitArray) {
+@prevWaitArray=@evntWaitArray;
+@prevTimeArray=@evntTimeArray;
+}
+ #****  Make a hash of the deltas for all wait events, so that we can print a separate report of worst waits.
+ #**********************************************************
+ %delta=();
+ for ( $evntNo=0;$evntNo<=$#evntWaitArray;$evntNo++) {
+ next if $evntTimeArray[$evntNo]-$prevTimeArray[$evntNo] == 0;
+ #Don't print idle events (SQL*Net message from client, PX idle wait, RDBMS IPC msg, pmon timer, or smon timer)
+  next if ($evntNo==$WAIT_PMON) || ($evntNo==$WAIT_IPC) || ($evntNo==$WAIT_SMON) ||
+  ($evntNo==$WAIT_SQLNET) || ($evntNo==$WAIT_PX_IDLE);
+   my $deltaTemp=sprintf "%010d.%010d.%04d",$evntTimeArray[$evntNo]-$prevTimeArray[$evntNo],
+   $evntWaitArray[$evntNo]-$prevWaitArray[$evntNo],$evntNo;
+   $delta{$deltaTemp}=$evntNo;
+  }
+}
+sub collect_MTS {
+ ($newdata{MTS_DISPATCHER_CREATED},$newdata{MTS_DISPATCHER_OWNED},$newdata{MTS_DISPATCHER_BUSY},$newdata{MTS_DISPATCHER_IDLE},
+ $newdata{MTS_DISPATCHER_BYTES},$newdata{MTS_DISPATCHER_COUNT})=
+ $dbh->selectrow_array($mtsDispatcherStmt);
+ ($newdata{MTS_SHARED_SERVER_TOTAL},$newdata{MTS_SHARED_SERVER_BUSY})=$dbh->selectrow_array($mtsSharedServerStmt);
+ ($newdata{MTS_QUEUE_COMMON_DEPTH},$newdata{MTS_QUEUE_COMMON_WAIT},$newdata{MTS_QUEUE_COMMON_TOTALQ},
+ $newdata{MTS_QUEUE_DISPATCH_DEPTH},$newdata{MTS_QUEUE_DISPATCH_WAIT},$newdata{MTS_QUEUE_DISPATCH_TOTALQ})=
+ $dbh->selectrow_array($mtsQueueStmt);
+}
+sub collect_SPool {
+my $Shared_pool_detail = `sqlplus -s inspector/$passwd <<END
+set echo off
+set feedback off
+set pagesize 0
+spool $outputFilenameSPool append
+alter session set nls_date_format='MON-DD-YYYY hh24:mi:ss';
+prompt DATE
+prompt ==================
+select sysdate from dual;
+prompt Name                                         GB
+prompt ====================================      ========
+select pool,name,bytes/1024/1024/1024 GB  from v\\\$sgastat where pool='shared pool' and bytes>500000000
+order by bytes desc; 
+prompt Gets       GetHits    PCTMISS_get PINS       PINHITS     RELOADS     INVALIDATIONS
+prompt ========== ========== =========== ========== =========== =========== =============
+select gets, gethits, round((1-GETHITRATIO ),2)*100 PCTMISS_get, PINS, PINHITS, RELOADS , INVALIDATIONS 
+from V\\\$LIBRARYCACHE where namespace='SQL AREA';
+spool off
+END
+`;
+}
+sub collect_sql {
+ #****  Get the execution stats for monitored SQL statements:
+ #**********************************************************
+ #print "DEBUG: loading  exec,get values\n";
+ foreach my $hash (keys %{$config->{SQLEXEC}}) {
+ #print "DEBUG: loading  exec,get values for $hash\n";
+my ($execs,$gets)=$dbh->selectrow_array($sqlExecStmt,{},$hash);
+ #print "DEBUG: got $execs, $gets for $hash\n";
+ $sqlExec->{$hash}->{execs}=$execs;
+ $sqlExec->{$hash}->{gets}=$gets;
+}
+}
+sub collect_latch {
+ #****  Handling Latch statistics
+ #**********************************************************
+my $latchList=$dbh->selectall_arrayref($latchStmt);
+ foreach my $latchRef (@$latchList) {
+my ($latchNum,$gets,$misses,$sleeps)=@$latchRef;
+ #print "Latches: $latchNum,$gets,$misses,$sleeps\n";
+ if (!exists $latches{$latchNum}) {
+$latches{$latchNum}={};
+$latches{$latchNum}->{NEW_GETS}=$gets;
+ $latches{$latchNum}->{NEW_MISSES}=$misses;
+ $latches{$latchNum}->{NEW_SLEEPS}=$sleeps;
+ $latches{$latchNum}->{OLD_GETS}=$gets;
+ $latches{$latchNum}->{OLD_MISSES}=$misses;
+ $latches{$latchNum}->{OLD_SLEEPS}=$sleeps;
+ next;
+    }
+ $latches{$latchNum}->{OLD_GETS}=$latches{$latchNum}->{NEW_GETS};
+ $latches{$latchNum}->{OLD_MISSES}=$latches{$latchNum}->{NEW_MISSES};
+ $latches{$latchNum}->{OLD_SLEEPS}=$latches{$latchNum}->{NEW_SLEEPS};
+ $latches{$latchNum}->{NEW_GETS}=$gets;
+ $latches{$latchNum}->{NEW_MISSES}=$misses;
+ $latches{$latchNum}->{NEW_SLEEPS}=$sleeps;
+   } 
+}
+sub collect_queue {
+ #**** Querying on V$QUEUE
+ #**********************************************************
+my $qList=$dbh->selectall_arrayref($sqlQueueStmt);
+ foreach my $qRef (@$qList) {
+my ($qType, $qQueued, $qWait, $qProcessed)=@$qRef;
+ if (!exists $qdata{$qType}) {
+ $qdata{$qType}={};
+ $qdata{$qType}->{NEW_QUEUED}=$qQueued;
+ $qdata{$qType}->{NEW_WAIT}=$qWait;
+ $qdata{$qType}->{NEW_PROCESSED}=$qProcessed;
+ $qdata{$qType}->{OLD_QUEUED}=$qQueued;
+ $qdata{$qType}->{OLD_WAIT}=$qWait;
+ $qdata{$qType}->{OLD_PROCESSED}=$qProcessed;
+ next;
+  }
+ $qdata{$qType}->{OLD_QUEUED}=$qdata{$qType}->{NEW_QUEUED};
+ $qdata{$qType}->{OLD_WAIT}=$qdata{$qType}->{NEW_WAIT};
+ $qdata{$qType}->{OLD_PROCESSED}=$qdata{$qType}->{NEW_PROCESSED};
+ $qdata{$qType}->{NEW_QUEUED}=$qQueued;
+ $qdata{$qType}->{NEW_WAIT}=$qWait;
+ $qdata{$qType}->{NEW_PROCESSED}=$qProcessed;
+ }
+}
+sub collect_ADG {
+ #**** ADG monitoring queries SF_CON_ADG.log (parpatel)
+ #**********************************************************
+ ($MRP)=$dbh->selectrow_array("select decode(count(1),0,'N','Y') MRP from v\$session where program like '%MRP%' and type='BACKGROUND'");
+ ($InTraf)=$dbh->selectrow_array("select /* 1 */ count(1) InTraf from v\$session where machine like '%ops.sfdc.net%' ");
+
+ $RTA=$dbh->selectrow_array(qq{select nvl(decode(recovery_mode,'MANAGED REAL TIME APPLY','Y','N'),'N') \
+ from v\$archive_dest_status where dest_id=1});
+ if ($DBRole ne "PRI"){
+ $LagSecs=$dbh->selectrow_array(qq{select nvl(min(lag),-1) from \
+ (\
+  (select max(abs((sysdate-to_date(time_computed, 'MM/DD/YYYY HH24:MI:SS'))*86400) + \
+      extract(second from to_dsinterval(value)) + \
+      (extract(minute from to_dsinterval(value))*60) + \
+      (extract(hour from to_dsinterval(value))*60*60) + \
+      (extract(day from to_dsinterval(value))*60*60*24)) lag \
+      from v\$dataguard_stats where name='apply lag' \
+   )\
+      union all
+         (select ceil(max(sysdate-timestamp)*86400) lag from v\$recovery_progress where item='Last Applied Redo') \
+      union all
+         (select  ceil(max(sysdate-checkpoint_time)*86400) lag from v\$datafile_header where file\#=1)
+   )\
+});
+ $TLagSecs=$dbh->selectrow_array(qq{select nvl( \
+(select max(abs((sysdate-to_date(time_computed, 'MM/DD/YYYY HH24:MI:SS'))*86400) + \
+ extract(second from to_dsinterval(value)) + (extract(minute from to_dsinterval(value))*60) + \
+ (extract(hour from to_dsinterval(value))*60*60) + (extract(day from to_dsinterval(value))*60*60*24)) lag \
+ from v\$dataguard_stats where name='transport lag'),-1) from dual});
+ $CkpT=$dbh->selectrow_array(qq{select nvl(max(cnt),0) from \
+ (select session_id, count(*) cnt from v\$active_session_history where event like '%checkpoint completed%' \
+  and sample_time > sysdate-($cycle_time/86400) group by session_id)});
+ $ApplyMB=$dbh->selectrow_array(qq{select nvl((select nvl(round(max(sofar)/1024,2),0) from v\$recovery_progress \
+ where item='Active Apply Rate'),0) from dual});
+ $R_IO=$dbh->selectrow_array(qq{select nvl(ceil(avg(time_waited)/1000), 0) from v\$active_Session_history \
+ where event = 'recovery read' and sample_time > sysdate-($cycle_time/86400) and time_waited > 0});
+ $RFS_W=$dbh->selectrow_array(qq{select nvl(ceil(avg(time_waited)/1000), 0) from v\$active_session_history
+ where event = 'RFS write'  and time_waited > 0 and sample_time > sysdate-($cycle_time/86400)});
+ $RFS_R=$dbh->selectrow_array(qq{select nvl(max(case when timestamp > sysdate-($cycle_time/86400) then 'Y' else 'N' end),'N') \
+ from v\$dataguard_status where message like '%RFS%Assigned to RFS%' and dest_id=0});
+ $MRPStat=$dbh->selectrow_array(qq{select nvl((select case status \
+ when 'APPLYING_LOG' then 'AL' \
+ when 'WAIT_FOR_LOG' then 'WFL' \
+ when 'WAIT_FOR_GAP' then 'WFG' \
+ ELSE 'NA' END MRP_STAT \
+ from v\$managed_standby where process like 'MRP0'),'NA') from dual});
+
+
+ $TSB=$dbh->selectrow_array(qq{select nvl(max(thread#||':'||sequence#||':'||block#), '0:0:0') \
+  from v\$managed_standby where process like 'MRP0%'});
+ } else {
+ $LagSecs=0;  
+ $TLagSecs=0;
+ $CkpT=0;
+ $ApplyMB=0;
+ $R_IO=0;
+ $RFS_W=0;
+ $RFS_R='N';
+ $MRPStat='NA';
+ $TSB='0:0:0';
+      }
+  # and for all databases the active count total count max value
+  ($ACnt, $TCnt, $MXV)=$dbh->selectrow_array("select active_cnt, total_cnt, max_value 
+  from (select CURRENT_UTILIZATION total_cnt, LIMIT_VALUE max_value 
+  from v\$resource_limit where resource_name='processes') a, 
+  (select count(*) active_cnt from v\$session where status='ACTIVE' and type='USER')");
+
+  # End of ADG monitoring queries (parpatel)
+}
+sub collect_activeThreads {
+# Get the SQL statements for active threads. This is used for two purposes: getting the total number of active threads, and
+ # getting the SQL statements in use
+ $activeSQLList=$dbh->selectall_arrayref($activeThreadStmt);
+ $activeThreads=0;
+ foreach my $activeEntry (@$activeSQLList) {
+ $activeThreads += $activeEntry->[1];
+ }
+}
+
+sub pick_stats {
+ # Get all the main report data. Most of these items are cumulative, so we'll subtract out the prior values. The
+ # numbers referenced in @statArray are statistic numbers from v$statname. The numbers  referenced in eventWaitArray
+ # and eventTimeArray are an internal "index" number that isn't visible in v$ tables. As mentioned above, you can find
+ # out what events have what numbers with: select  indx,kslednam from x$ksled
+ $newdata{CGET}=$statArray[$STAT_CGET]; #consistant gets
+ $newdata{DBGET}=$statArray[$STAT_BGET]; #buffer gets
+ $newdata{TREADS}=$statArray[$STAT_TPREAD]; #physical reads
+ $newdata{READS}=$statArray[$STAT_PREAD]; #physical reads
+ $newdata{RIOPS}=$statArray[$STAT_RIOPS]; #physical reads
+ $newdata{SENT}=$statArray[$STAT_BYT_OUT]; #bytes sent to client
+ $newdata{EXEC}=$statArray[$STAT_EXEC]; #execute count
+ $newdata{FBREQ}=$statArray[$STAT_FBR]; #free buffers requested
+ $newdata{DBINS}=$statArray[$STAT_DBI]; #dirty buffers inspected
+ $newdata{FBINS}=$statArray[$STAT_FBI]; #free buffers inspected
+ $newdata{TWRITES}=$statArray[$STAT_TPWRITE]; #physical writes Total
+ $newdata{WRITES}=$statArray[$STAT_PWRITE]; #physical writes
+ $newdata{TEMPB}=$statArray[$STAT_TEMPB]; #Temp usage
+ $newdata{WIOPS}=$statArray[$STAT_WIOPS]; #physical writes IOPS
+ $newdata{BBW_CNT}=$evntWaitArray[$WAIT_BBW]; #buffer busy waits
+ $newdata{BBW_TIME}=$evntTimeArray[$WAIT_BBW]; #buffer busy waits
+ $newdata{LOGONS}=$statArray[$STAT_LOGON]; #new logons
+ #$newdata{CPU}=$statArray[$STAT_CPU]; #total CPU
+ $newdata{CPU}=$dbh->selectrow_array("select nvl(value,0) from v\$sysmetric where metric_name='Host CPU Utilization (%)' and (end_time -begin_time)<.000273611");
+ $newdata{LF_CNT}=$evntWaitArray[$WAIT_LF]; #latch free waits
+ $newdata{LF_TIME}=$evntTimeArray[$WAIT_LF]; #latch free waits
+ $newdata{DBF_CNT}=$evntWaitArray[$WAIT_SEQREAD]; #db file seq. read Count
+ $newdata{DBF_TIME}=$evntTimeArray[$WAIT_SEQREAD]; #db file seq. read time
+ $newdata{LFS_CNT}=$evntWaitArray[$WAIT_LFS]; #log file sync count
+ $newdata{LFS_TIME}=$evntTimeArray[$WAIT_LFS]; #log file sync time
+ $newdata{WAIT_FCSBPR_CNT}=$evntWaitArray[$WAIT_FCSBPR]; #flash cache single block physical read
+ $newdata{WAIT_FCSBPR_TIME}=$evntTimeArray[$WAIT_FCSBPR]; #flash cache single block physical read
+ $newdata{WAIT_FCMBPR_CNT}=$evntWaitArray[$WAIT_FCMBPR]; #flash cache multi block physical read
+ $newdata{WAIT_FCMBPR_TIME}=$evntTimeArray[$WAIT_FCMBPR]; #flash cache multi block physical read
+ $newdata{STAT_PRFCH_V}=$statArray[$STAT_PRFCH]; # Physical read flash cache hit
+ $newdata{STAT_FCI_V}=$statArray[$STAT_FCI]; # flash cache Insert
+
+ $newdata{LFPW_CNT}=$evntWaitArray[$WAIT_LGF_PWRITE]; #log file parallel write
+ $newdata{LFPW_TIME}=$evntTimeArray[$WAIT_LGF_PWRITE]; #log file sync time
+ $newdata{DBFScat_CNT}=$evntWaitArray[$WAIT_DBF_SCAT_RD]; #db file Scatter. read Count
+ $newdata{DBFScat_TIME}=$evntTimeArray[$WAIT_DBF_SCAT_RD]; #db file Scatter. read time
+ $newdata{DPR_CNT}=$evntWaitArray[$WAIT_DIR_READ]; #Direct path read count
+ $newdata{DPR_TIME}=$evntTimeArray[$WAIT_DIR_READ]; #Direct Path Read time
+
+ $newdata{WAIT_FCW_CNT}=$evntWaitArray[$WAIT_FCW]; #flash cache single block physical read
+ $newdata{WAIT_FCW_TIME}=$evntTimeArray[$WAIT_FCW]; #flash cache single block physical read
+ $newdata{WAIT_WCWFC_CNT}=$evntWaitArray[$WAIT_WCWFC]; #flash cache single block physical read
+ $newdata{WAIT_WCWFC_TIME}=$evntTimeArray[$WAIT_WCWFC]; #flash cache single block physical read
+ $newdata{WAIT_FCIW_CNT}=$evntWaitArray[$WAIT_FCIW]; #flash cache single block physical read
+ $newdata{WAIT_FCIW_TIME}=$evntTimeArray[$WAIT_FCIW]; #flash cache single block physical read
+ $newdata{WAIT_FCDDW_CNT}=$evntWaitArray[$WAIT_FCDDW]; #flash cache single block physical read
+ $newdata{WAIT_FCDDW_TIME}=$evntTimeArray[$WAIT_FCDDW]; #flash cache single block physical read
+
+ $newdata{PQ}=$dbh->selectrow_array($pqServersBusyStmt); #number of busy PQ servers
+ #$newdata{ACT}=$activeThreads; #active threads, computed above.
+ $newdata{ACT}=$dbh->selectrow_array("select nvl(value,0) from v\$sysmetric where metric_name='Average Active Sessions' and (end_time -begin_time)<.000273611");
+ $newdata{ActUNDO}=$dbh->selectrow_array("select nvl(round((sum(bytes)/1024/1024/1024),2),0) from dba_undo_extents where tablespace_name in (select value from v\$parameter where name='undo_tablespace') and status='ACTIVE'");
+ $newdata{UnExpUNDO}=$dbh->selectrow_array("select nvl(round((sum(bytes)/1024/1024/1024),2),0) from dba_undo_extents where tablespace_name in (select value from v\$parameter where name='undo_tablespace') and status='UNEXPIRED'");
+ $newdata{ExpUNDO}=$dbh->selectrow_array("select nvl(round((sum(bytes)/1024/1024/1024),2),0) from dba_undo_extents where tablespace_name in (select value from v\$parameter where name='undo_tablespace') and status='EXPIRED'");
+ #$newdata{MAXUNDO}=$MaxUNDO; #Max Undo used by a single users
+ $newdata{REDO}=$statArray[$STAT_REDO]; #redo blocks written
+ $newdata{UNDO}=$statArray[$STAT_UNDO]; #UNDO blocks written
+ $newdata{CCHG}=$statArray[$STAT_CCHG]; #consistent changes
+ $newdata{PARSE_TOTAL}=$statArray[$STAT_PARSE_TOTAL]; #Total parses
+ $newdata{PARSE_HARD}=$statArray[$STAT_PARSE_HARD]; #hard parses
+ $newdata{PARSE_CPU}=$statArray[$STAT_PARSE_CPU]; #parse CPU time
+ $newdata{PARSE_ELA}=$statArray[$STAT_PARSE_ELA]; #parse elapsed time
+ $newdata{CALLS}=$statArray[$STAT_CALLS]; #User calls
+ $newdata{COMMITS}=$statArray[$STAT_COMMITS]; #User commits
+ $newdata{ROLLBACKS}=$statArray[$STAT_ROLLBACKS]; #User Rollbacks
+ if ($flagteng eq 'Y') {
+ $newdata{ENQ_CNT}=$evntWaitArray[$WAIT_ENQ_TM]+$evntWaitArray[$WAIT_ENQ_TX_ROW]+
+ $evntWaitArray[$WAIT_ENQ_TX_ITL]+$evntWaitArray[$WAIT_ENQ_TX_IND]; #enqueue waits
+ $newdata{ENQ_TIME}=$evntTimeArray[$WAIT_ENQ_TM]+$evntTimeArray[$WAIT_ENQ_TX_ROW]+
+ $evntTimeArray[$WAIT_ENQ_TX_ITL]+$evntTimeArray[$WAIT_ENQ_TX_IND]; #enqueue waits
+ } else {
+ $newdata{ENQ_CNT}=$evntWaitArray[$WAIT_ENQ]; #enqueue waits
+ $newdata{ENQ_TIME}=$evntTimeArray[$WAIT_ENQ]; #enqueue waits
+ }
+ $newdata{LC_PIN_CNT}=$evntWaitArray[$WAIT_LC_PIN]; #library cache pin waits
+ $newdata{LC_PIN_TIME}=$evntTimeArray[$WAIT_LC_PIN]; #library cache pin waits
+ $newdata{LC_LOCK_CNT}=$evntWaitArray[$WAIT_LC_LOCK]; #library cache lock waits
+ $newdata{LC_LOCK_TIME}=$evntTimeArray[$WAIT_LC_LOCK]; #library cache lock waits
+ $newdata{SP_FLUSH}=$spFlush;
+ $newdata{SP_4031}=$sp4031;
+ $newdata{EIDMEM}=$STAT_EIDMEM;
+ $newdata{SQLA}=$STAT_SQLA;
+ $newdata{PXMPool}=$STAT_PXMPool;
+ $newdata{KGLH0}=$STAT_KGLH0;
+ $newdata{FreMem}=$STAT_FreMem;
+ $newdata{KGLHD}=$STAT_KGLHD;
+ $newdata{DBHBuckets}=$STAT_DBHBuckets;
+ $newdata{GCSRes}=$STAT_GCSRes;
+ $newdata{GCSShadow}=$STAT_GCSShadow;
+ # OBSOLETED-SHARED, replaced by MTS
+ # $newdata{SS_REQUESTS}=$ssRequests;
+ # $newdata{SS_IDLE}=$ssIdle;
+ # $newdata{SS_BUSY}=$ssBusy;
+ # #$newdata{DISP_OWNED}=$dispOwned;
+ # $newdata{DISP_IDLE}=$dispIdle;
+ # $newdata{DISP_BUSY}=$dispBusy;
+ #GCWaits GCTime  CRtx  CRrx   ActBtx    ActBrx   ActBRx_ms   GC_CR_Msg  GC_Enq_Msg     Total_MB  Execs     CPU    ACT
+ if ($rac_on) {
+ $newdata{GC_WAIT}=$gcWait;
+ $newdata{GC_TIME}=$gcTime;
+ $newdata{GC_CR_BLOCKS}=$statArray[$GC_CR_BLOCKS_SERVED]; #gc consistent read blocks served
+ $newdata{GC_CR_BLOCKS_TIME}=$statArray[$GC_CR_BLOCKS_SERVED_TIME]; #gc consistent read blocks served
+ $newdata{GC_CR_BLOCKR}=$statArray[$GC_CR_BLOCKS_RECEIVED]; #gc consistent read blocks received
+ $newdata{GC_CR_BLOCKR_TIME}=$statArray[$GC_CR_BLOCKS_RECEIVED_TIME]; #gc consistent read blocks received
+ $newdata{GC_CU_BLOCKS}=$statArray[$GC_CUR_BLOCKS_SERVED]; #gc current read blocks served
+ $newdata{GC_CU_BLOCKS_TIME}=$statArray[$GC_CUR_BLOCKS_SERVED_TIME]; #gc current read blocks served
+ $newdata{GC_CU_BLOCKR}=$statArray[$GC_CUR_BLOCKS_RECEIVED]; #gc current read blocks served
+ $newdata{GC_CU_BLOCKR_TIME}=$statArray[$GC_CUR_BLOCKS_RECEIVED_TIME]; #gc current read blocks served
+ $newdata{GC_CR_MESSAGE}=$statArray[$GC_CR_MSG]; #gc CR messages
+ $newdata{GC_ENQ_MESSAGE}=$statArray[$GC_Enq_MSG]; #gc Enq Messages
+ $newdata{EXEC}=$statArray[$STAT_EXEC]; #execute count
+ #$newdata{CPU}=$statArray[$STAT_CPU]; #total CPU
+ $newdata{CPU}=$dbh->selectrow_array("select nvl(value,0) from v\$sysmetric where metric_name='Host CPU Utilization (%)' and (end_time -begin_time)<.000273611");
+ #$newdata{ACT}=$activeThreads; #active threads, computed above.
+ $newdata{ACT}=$dbh->selectrow_array("select nvl(value,0) from v\$sysmetric where metric_name='Average Active Sessions' and (end_time -begin_time)<.000273611");
+ }
+}
+
+sub set_old2new  {
+ %olddata=%newdata; #This is our first line, so use the same data for a baseline. This makes all deltas zero,
+ # instead of strange, large numbers.
+ foreach my $hash (keys %{$sqlExec})  {
+ $sqlExec->{$hash}->{execs_old}=$sqlExec->{$hash}->{execs};
+ $sqlExec->{$hash}->{gets_old}=$sqlExec->{$hash}->{gets};
+ }
+}
+
+sub print_mainFile {
+ #print MAIN_FILE "   CGet BGet    APhyR RIops AWrites WIops  Sent  IntrC   Execs  HParse SParse  ";
+ #print MAIN_FILE " Load   Log    CPU%  DBF  ACT   REDO   UNDO   EnQ\n";
+ #printf MAIN_FILE "%s %4dK %3dK  %6.2fM  %6.2fM  %5d  %6.2fM  %6.2fM %5d  %4.1fM %5.1fM  %5d %5.1f %6d %6.2f %5.1f %7.2f %4.2fms %4.2f   %4d %5.2fM %5.2fM %4d %4d %4d\n",$date,
+ printf MAIN_FILE "%s %6.2f  %7.2f  %5.2f  %5d %6.2f %5d  %4.1f  %5.1f  %5d %5.1f %6d %6.2f %4.1f %5.2f %5.2f  %5.2f  %4d %5.2f %5.2f %4d %4d %4d\n",$date,
+ ($newdata{DBGET}-$olddata{DBGET})/1000/$cycle_time,
+ ($newdata{CGET}-$olddata{CGET})/1000/$cycle_time,
+# ($newdata{TREADS}-$olddata{TREADS})/1000000/$cycle_time,
+ ($newdata{READS}-$olddata{READS})*8/1000/$cycle_time,
+ ($newdata{RIOPS}-$olddata{RIOPS})/$cycle_time,
+# ($newdata{TWRITES}-$olddata{TWRITES})/1000000/$cycle_time,
+ ($newdata{WRITES}-$olddata{WRITES})*8/1000/$cycle_time,
+ ($newdata{WIOPS}-$olddata{WIOPS})/$cycle_time,
+ ($newdata{SENT}-$olddata{SENT})/1000000/$cycle_time,
+ ((($newdata{GC_CR_BLOCKS}-$olddata{GC_CR_BLOCKS})+($newdata{GC_CR_BLOCKR}-$olddata{GC_CR_BLOCKR})+($newdata{GC_CU_BLOCKS}-$olddata{GC_CU_BLOCKS})+($newdata{GC_CU_BLOCKR}-$olddata{GC_CU_BLOCKR}))*1.1*8192/1000/1000+(($newdata{GC_CR_MESSAGE}-$olddata{GC_CR_MESSAGE})+($newdata{GC_ENQ_MESSAGE}-$olddata{GC_ENQ_MESSAGE}))*1.2/5000)/$cycle_time,
+ ($newdata{EXEC}-$olddata{EXEC})/$cycle_time,
+ ($newdata{PARSE_HARD}-$olddata{PARSE_HARD})/$cycle_time,
+ ((($newdata{PARSE_TOTAL}-$olddata{PARSE_TOTAL})-($newdata{PARSE_HARD}-$olddata{PARSE_HARD})))/$cycle_time,
+ $load,
+ ($newdata{LOGONS}-$olddata{LOGONS})/$cycle_time,
+ #($newdata{CPU}-$olddata{CPU})/$CPUCount/$cycle_time,
+ $newdata{CPU},
+ (($newdata{DBF_TIME}-$olddata{DBF_TIME})/($newdata{DBF_CNT}+1-$olddata{DBF_CNT}))/100/$cycle_time,
+ (($newdata{LFS_TIME}-$olddata{LFS_TIME})/($newdata{LFS_CNT}+1-$olddata{LFS_CNT}))/100/$cycle_time,
+ $newdata{ACT},
+ ($newdata{TREADS}-$olddata{TREADS})/1000000/$cycle_time,
+ ($newdata{UNDO}-$olddata{UNDO})*8/1024/$cycle_time,
+ ($newdata{COMMITS}-$olddata{COMMITS})/$cycle_time,
+ ($newdata{ROLLBACKS}-$olddata{ROLLBACKS})/$cycle_time,
+ $newdata{ENQ_CNT}-$olddata{ENQ_CNT};
+}
+sub print_IOFile {
+  #print IO_FILE "Date          Time    TPhyRd RdMB  RIOPS  TPhyW  WrMB WIOPS TIOPS  DfSRCn   DfSR TSctRCn TSctR  TDprCt  Dpr TLfsCt Lfs LfpwCt Lfpw REDOMB ActUNDO UnXUNDO ExUNDO TEMPMB\n";
+  #te          Time   TPhyRd APhyR RIO TPhyW APhyW WIO TIOP DfS DfSR TSctRTSctR TDCt  Dpr TLfsCt Lfs Lfp Lfpw REDOMB ActUNDO UnXUNDO ExUNDO TEMPMB\n";
+  printf IO_FILE  "%s  %7.2f %6.2f %5d %7.2f %6.2f %5d %5d %6d %5.2f %7d  %4.2f %6d  %4.2f %6d %5.2f %6d %5.2f %6.2f %7.2f %7.2f %6.2f %6d\n",
+   $date,
+  ($newdata{TREADS}-$olddata{TREADS})/1000000/$cycle_time,
+  ($newdata{READS}-$olddata{READS})*8/1000/$cycle_time,
+  ($newdata{RIOPS}-$olddata{RIOPS})/$cycle_time,
+  ($newdata{TWRITES}-$olddata{TWRITES})/1000000/$cycle_time,
+  ($newdata{WRITES}-$olddata{WRITES})*8/1000/$cycle_time,
+  ($newdata{WIOPS}-$olddata{WIOPS})/$cycle_time,
+  (($newdata{RIOPS}+$newdata{WIOPS})-($olddata{RIOPS}+$olddata{WIOPS}))/$cycle_time,
+  ($newdata{DBF_CNT}-$olddata{DBF_CNT})/$cycle_time,
+  (($newdata{DBF_TIME}-$olddata{DBF_TIME})/($newdata{DBF_CNT}+1-$olddata{DBF_CNT}))/100/$cycle_time,
+  ($newdata{DBFScat_CNT}-$olddata{DBFScat_CNT})/$cycle_time,
+  (($newdata{DBFScat_TIME}-$olddata{DBFScat_TIME})/($newdata{DBFScat_CNT}+1-$olddata{DBFScat_CNT}))/100/$cycle_time,
+  ($newdata{DPR_CNT}-$olddata{DPR_CNT})/$cycle_time,
+  (($newdata{DPR_TIME}-$olddata{DPR_TIME})/($newdata{DPR_CNT}+1-$olddata{DPR_CNT}))/100/$cycle_time,
+  ($newdata{LFS_CNT}-$olddata{LFS_CNT})/$cycle_time,
+  (($newdata{LFS_TIME}-$olddata{LFS_TIME})/($newdata{LFS_CNT}+1-$olddata{LFS_CNT}))/100/$cycle_time,
+  ($newdata{LFPW_CNT}-$olddata{LFPW_CNT})/$cycle_time,
+  (($newdata{LFPW_TIME}-$olddata{LFPW_TIME})/($newdata{LFPW_CNT}+1-$olddata{LFPW_CNT}))/100/$cycle_time,
+  ($newdata{REDO}-$olddata{REDO})/2048/$cycle_time,
+  $newdata{ActUNDO},
+  $newdata{UnExpUNDO},
+  $newdata{ExpUNDO},
+  ($newdata{TEMPB}-$olddata{TEMPB})/1000000/$cycle_time,
+  }
+sub print_FLASHFile {
+  #print FLASH_FILE "Date       Time    FCPreadVol  FCPreadPerf PreadFCHit FCIsert dFCmbPread  dFCWrite  wcWaitFC  dFCInvalW   dFCdisw\n";
+ printf FLASH_FILE  "%s   %9d  %11.2f  %9d  %7d  %7.2f %9.2f  %9.2f   %7.2f\n",
+ $date,
+ ($newdata{WAIT_FCSBPR_TIME}-$olddata{WAIT_FCSBPR_TIME})/$cycle_time,
+ ($newdata{WAIT_FCSBPR_TIME}-$olddata{WAIT_FCSBPR_TIME})/($newdata{WAIT_FCSBPR_CNT}+1-$olddata{WAIT_FCSBPR_CNT})/100/$cycle_time,
+ ($newdata{STAT_PRFCH_V}-$olddata{STAT_PRFCH_V})/$cycle_time,
+ ($newdata{STAT_FCI_V}-$olddata{STAT_FCI_V})/$cycle_time,
+ ($newdata{WAIT_FCW_TIME}-$olddata{WAIT_FCW_TIME})/$cycle_time,
+ ($newdata{WAIT_WCWFC_TIME}-$olddata{WAIT_WCWFC_TIME})/$cycle_time,
+ ($newdata{WAIT_FCIW_TIME}-$olddata{WAIT_FCIW_TIME})/$cycle_time,
+ ($newdata{WAIT_FCDDW_TIME}-$olddata{WAIT_FCDDW_TIME})/$cycle_time;
+ }
+
+sub print_waitFile {
+ # Print to the "wait" file
+my $waitCount=0;
+my $waitMarker;
+ print WAIT_FILE "$date: ";
+ foreach $waitMarker (reverse sort keys %delta) {
+ last if $waitCount++>10;
+ print WAIT_FILE ", " if $waitCount>1;
+my $statNum=$delta{$waitMarker};
+ printf WAIT_FILE "%d: %d-%d",$statNum,$evntTimeArray[$statNum]-$prevTimeArray[$statNum],
+ $evntWaitArray[$statNum]-$prevWaitArray[$statNum];
+ }
+ print WAIT_FILE "\n";
+}
+
+sub print_latchFile{
+ # Print to the "latch" file
+ print LATCH_FILE "$date: ";
+ foreach my $latchNo (sort {$latches{$b}->{NEW_MISSES}-$latches{$b}->{OLD_MISSES} <=>
+ $latches{$a}->{NEW_MISSES}-$latches{$a}->{OLD_MISSES}} keys %latches) {
+ next if $latches{$latchNo}->{NEW_MISSES}==$latches{$latchNo}->{OLD_MISSES};
+ printf LATCH_FILE "$latchNo: %d,%d,%d; ",
+ $latches{$latchNo}->{NEW_GETS}-$latches{$latchNo}->{OLD_GETS},
+ $latches{$latchNo}->{NEW_MISSES}-$latches{$latchNo}->{OLD_MISSES},
+ $latches{$latchNo}->{NEW_SLEEPS}-$latches{$latchNo}->{OLD_SLEEPS};
+ }
+ print LATCH_FILE "\n";
+}
+
+sub print_execFile {
+ #Print to the "exec" file
+ print EXEC_FILE "$date: ";
+ foreach my $hash (sort keys %{$sqlExec})  {
+ my $sqlValues=sprintf("%d:%d",$sqlExec->{$hash}->{execs}-$sqlExec->{$hash}->{execs_old},
+ $sqlExec->{$hash}->{gets}-$sqlExec->{$hash}->{gets_old});
+
+ printf EXEC_FILE "%15s ",$sqlValues;
+ }
+
+ print EXEC_FILE "\n";
+}
+sub print_sqlFile {
+ #Print to the "sql" file
+ print SQL_FILE "$date: ";
+ my $sqlCount=0;
+ foreach my $activeEntry (@$activeSQLList) {
+ last if $sqlCount++>15;
+ print SQL_FILE ", " if $sqlCount>1;
+ printf SQL_FILE "%s: %s",$activeEntry->[0],$activeEntry->[1];
+ }
+ print SQL_FILE "\n";
+}
+
+sub print_exFile {
+ printf EX_FILE "%s %4d %3d %6d %3d %3d %6d %5d %5d %4d\n",$date,
+ ($newdata{LC_PIN_TIME}-$olddata{LC_PIN_TIME})+
+ ($newdata{LC_LOCK_TIME}-$olddata{LC_LOCK_TIME}),
+ $newdata{PARSE_HARD}-$olddata{PARSE_HARD},
+ (($newdata{PARSE_TOTAL}-$olddata{PARSE_TOTAL})-($newdata{PARSE_HARD}-$olddata{PARSE_HARD})),
+ ($newdata{PARSE_CPU}-$olddata{PARSE_CPU}),
+ ($newdata{PARSE_ELA}-$olddata{PARSE_ELA}),
+ $newdata{CALLS}-$olddata{CALLS},
+ $newdata{COMMITS}-$olddata{COMMITS},
+ $newdata{SP_FLUSH}-$olddata{SP_FLUSH},
+ $newdata{SP_4031}-$olddata{SP_4031};
+}
+sub print_MTSFile {
+ #print to the "MTS" file
+ if (($newdata{MTS_QUEUE_DISPATCH_TOTALQ}==$olddata{MTS_QUEUE_DISPATCH_TOTALQ}) or
+ ($newdata{MTS_QUEUE_COMMON_TOTALQ}==$olddata{MTS_QUEUE_COMMON_TOTALQ}) or
+ ($newdata{MTS_DISPATCHER_BUSY}-$olddata{MTS_DISPATCHER_BUSY}+
+ $newdata{MTS_DISPATCHER_IDLE}-$olddata{MTS_DISPATCHER_IDLE})==0) {
+ print MTS_FILE "$date:\n";
+ } else {
+ printf MTS_FILE "%s: %4d %4d %4d %5d %4.1d %4d %4d %4d %4d\n",
+ $date,$newdata{MTS_SHARED_SERVER_TOTAL},$newdata{MTS_SHARED_SERVER_BUSY},
+ $newdata{MTS_DISPATCHER_CREATED}-$olddata{MTS_DISPATCHER_CREATED}, #new MTS logins
+ $newdata{MTS_DISPATCHER_OWNED}, #current total MTS sessions
+ 100*($newdata{MTS_DISPATCHER_BUSY}-$olddata{MTS_DISPATCHER_BUSY})/
+ ($newdata{MTS_DISPATCHER_BUSY}-$olddata{MTS_DISPATCHER_BUSY}+
+ $newdata{MTS_DISPATCHER_IDLE}-$olddata{MTS_DISPATCHER_IDLE}), #Dispatcher pct busy
+ $newdata{MTS_QUEUE_COMMON_DEPTH}, #Depth of common queue
+ $newdata{MTS_QUEUE_DISPATCH_DEPTH}, #Depth of dispatcher queue
+ ($newdata{MTS_QUEUE_COMMON_WAIT}-$olddata{MTS_QUEUE_COMMON_WAIT})/
+ (1000*($newdata{MTS_QUEUE_COMMON_TOTALQ}-$olddata{MTS_QUEUE_COMMON_TOTALQ})), #Average service time common queue
+ ($newdata{MTS_QUEUE_DISPATCH_WAIT}-$olddata{MTS_QUEUE_DISPATCH_WAIT})/
+ (1000*($newdata{MTS_QUEUE_DISPATCH_TOTALQ}-$olddata{MTS_QUEUE_DISPATCH_TOTALQ})), #Average service time dispatcher queue
+   }
+}
+
+sub print_sharedFile {
+ if(($newdata{SS_IDLE}-$olddata{SS_IDLE}+($newdata{SS_BUSY}-$olddata{SS_BUSY}))!=0)
+ {
+ $ss_per_busy = ( ($newdata{SS_BUSY}-$olddata{SS_BUSY})/
+ ($newdata{SS_IDLE}-$olddata{SS_IDLE}+$newdata{SS_BUSY}-$olddata{SS_BUSY}) )*100;
+ } else {
+ $ss_per_busy=0;
+ }
+
+if(($newdata{DISP_IDLE}-$olddata{DISP_IDLE}+($newdata{DISP_BUSY}-$olddata{DISP_BUSY}))!=0)
+ {
+ $disp_per_busy = ( ($newdata{DISP_BUSY}-$olddata{DISP_BUSY})/($newdata{DISP_IDLE}-
+ $olddata{DISP_IDLE}+$newdata{DISP_BUSY}-$olddata{DISP_BUSY}) )*100;
+ } else {
+ $disp_per_busy=0;
+ }
+
+  printf SHARED_FILE "%s %6d %5d %5d %7d %3d %3d %4d %4d\n", $date,
+  $newdata{SS_REQUESTS}-$olddata{SS_REQUESTS}, $ss_per_busy,
+  $newdata{DISP_OWNED}, $disp_per_busy,
+  $qdata{'COMMON'}->{NEW_QUEUED}, $qdata{'DISPATCHER'}->{NEW_QUEUED},
+  $qdata{'COMMON'}->{NEW_WAIT}-$qdata{'COMMON'}->{OLD_WAIT},
+  $qdata{'DISPATCHER'}->{NEW_WAIT}-$qdata{'DISPATCHER'}->{OLD_WAIT}
+  ;
+}
+  #GCWaits GCTime  CRtx  CRrx   ActBtx    ActBrx   ActBRx_ms   GC_CR_Msg  GC_Enq_Msg     Total_MB  Execs     CPU    ACT
+sub print_RACFile {
+ printf RAC_FILE "%s %6d %6d %5d %5d %8d %9d  %8.2f  %10.2f %11d %11d %10.2f   %9d %5d %4d\n", 
+ $date, 
+ ($newdata{GC_WAIT}-$olddata{GC_WAIT})/$cycle_time,
+ ($newdata{GC_TIME}-$olddata{GC_TIME})/$cycle_time,
+ ($newdata{GC_CR_BLOCKS}-$olddata{GC_CR_BLOCKS})/$cycle_time,
+ ($newdata{GC_CR_BLOCKR}-$olddata{GC_CR_BLOCKR})/$cycle_time,
+ ($newdata{GC_CU_BLOCKS}-$olddata{GC_CU_BLOCKS})/$cycle_time,
+ ($newdata{GC_CU_BLOCKR}-$olddata{GC_CU_BLOCKR})/$cycle_time,
+ ($newdata{GC_CR_BLOCKR_TIME}-$olddata{GC_CR_BLOCKR_TIME})*10/($newdata{GC_CR_BLOCKR}+1-$olddata{GC_CR_BLOCKR}),
+ ($newdata{GC_CU_BLOCKR_TIME}-$olddata{GC_CU_BLOCKR_TIME})*10/($newdata{GC_CU_BLOCKR}+1-$olddata{GC_CU_BLOCKR}),
+ ($newdata{GC_CR_MESSAGE}-$olddata{GC_CR_MESSAGE})/$cycle_time,
+ ($newdata{GC_ENQ_MESSAGE}-$olddata{GC_ENQ_MESSAGE})/$cycle_time,
+ ((($newdata{GC_CR_BLOCKS}-$olddata{GC_CR_BLOCKS})+($newdata{GC_CR_BLOCKR}-$olddata{GC_CR_BLOCKR})+($newdata{GC_CU_BLOCKS}-$olddata{GC_CU_BLOCKS})+($newdata{GC_CU_BLOCKR}-$olddata{GC_CU_BLOCKR}))*1.1*8192/1000/1000+(($newdata{GC_CR_MESSAGE}-$olddata{GC_CR_MESSAGE})+($newdata{GC_ENQ_MESSAGE}-$olddata{GC_ENQ_MESSAGE}))*1.2/5000)/$cycle_time,
+ ($newdata{EXEC}-$olddata{EXEC})/$cycle_time,
+ #($newdata{(PU}-$olddata{CPU})/$CPUCount/$cycle_time,
+ $newdata{CPU},
+ $newdata{ACT};
+}
+sub print_ADGFile {
+ # ADG output to SF_CON_ADG.log (parpatel)
+ printf ADG_FILE "%s %-7s %-16s %-8s %-4s %-4d %-4d %-5d %-3s %-5d %-3s %-4d %-5d %-4d %-5.2f %-4d %-5d %-5s %-5s %s\n", 
+ $date,$DBNm,$DBUQNm,$ora_sid,$DBRole,$ACnt,$TCnt,$MXV,$MRP,$InTraf,$RTA,$LagSecs,
+ $TLagSecs,$CkpT,$ApplyMB,$R_IO,$RFS_W,$RFS_R,$MRPStat,$TSB;
+ # End of ADG output to SF_CON_ADG.log (parpatel), and yes, lines were wrapped by Alex.
+}
+
+sub get_proc_signature {
+my $p_pid=$_[0];
+my @out=`ps -eo "pid ruser args"`;
+ for my $str (@out) {
+my ($pid, $ruser)=split ' ',$str;
+ if ($pid eq $p_pid ) {
+my $signt=md5_base64($str);
+ print "Signature $signt on :$str\n";
+ return $signt;
+ }
+ }
+ return "0";
+}
+
+sub notify {
+my $msg=$_[0];
+my $host=`hostname`;
+ chomp $host;
+ open (EMAIL,"|mail $NOTIF_ADDR ") or die;
+ print EMAIL "TO: $NOTIF_ADDR\n";
+ print EMAIL "FROM: SFCON\@$host\n";
+ print EMAIL "SUBJECT: SFCON problem at $host\n";
+ print "\n";
+ print EMAIL $msg;
+ close EMAIL;
+}
+
+sub SFCON_running() {
+my $ora_sid=shift @_;
+my $script_name=`basename $0`; chomp $script_name;
+my $LFILE=$outputFilename.".PID";
+ 
+open(SFCON_PID,">> $LFILE") or die "Could not open $LFILE";
+ close SFCON_PID;
+ open(SFCON_PID,"+< $LFILE") or die "Could not open $LFILE";
+select SFCON_PID; $|=1;
+ select STDOUT;
+ if (flock SFCON_PID, (LOCK_EX|LOCK_NB)  ) {
+ print "Nobody held a lock over $LFILE \n";
+ truncate SFCON_PID,0 or die;
+ print SFCON_PID "$$\n";
+ print SFCON_PID get_proc_signature($$)."\n";
+ return 0;
+ } else {
+ print "Could not lock $LFILE\n";
+ seek(SFCON_PID,0,0) or die;  
+my $pid=<SFCON_PID>;chomp $pid;
+my $signature=<SFCON_PID>;chomp $signature;
+my $proc_signature=get_proc_signature($pid);
+if ($signature eq $proc_signature ) {
+print "SFCON is already running: $pid\n, exiting\n";
+close SFCON_PID;
+return 1;
+  } else {
+  my $msg="Lock on file $LFILE is held but corresponding process $pid is not present\n";
+  $msg.="SIGNATURES:  Recorded in file :$signature  Extracted by PID $pid : $proc_signature\n";
+  print $msg;
+  notify($msg);
+  die;
+  }
+ }
+}  
+ 
+ 
+ 
+
+
+sub execute_in_correct_environment {
+print "Sourcing profile, re-executing with right perl\n";
+my $cmd=<<EOF;
+export ORACLE_SID=$ora_sid
+export PERL_HOME="$perl_home"
+export PARAMS="$initial_params"
+export MYSELF=$0
+EOF
+$cmd.=<<'EOF';
+echo "ORACLE_SID:'$ORACLE_SID'"
+ BK_SID=$ORACLE_SID
+ [[ -r $HOME/.bashrc ]] && . $HOME/.bashrc
+ export ORACLE_SID=$BK_SID # In case profiles redefine that.
+ export ORAENV_ASK=NO
+ export ORACLE_HOME=/oracle/rdbms/11.2.0.4
+ export LD_LIBRARY_PATH=/oracle/rdbms/11.2.0.4/lib
+ export PATH=$ORACLE_HOME/bin:$PATH
+ oraenv  
+ PERL_HOME=${PERL_HOME:-$ORACLE_HOME/perl}
+ export PERL5LIB=$PERL_HOME/lib:$PERL_HOME/lib/site_perl
+ export CORRECT_ENVIRONMENT=YES
+ echo $PERL_HOME/bin/perl $MYSELF $PARAMS
+      exec $PERL_HOME/bin/perl $MYSELF $PARAMS
+     echo status:$?
+EOF
+     print "$cmd";
+     exec ('/bin/ksh','-c', "$cmd") or die "failure on exec";
+     die "could not set correct environment"
+}
+
