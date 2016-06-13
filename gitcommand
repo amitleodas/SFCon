@@ -1,0 +1,500 @@
+  387  kill -9 4949
+  388  ps -ef|grep Fire
+  389  kill -9 39610
+  390  ps -ef|grep Upload
+  391  ps -ef|grep pload
+  392  ps -ef|grep Fire
+  393  kill -9 2045
+  394  hostname
+  395  vi m3.lst
+  396  ls -ltr m3*
+  397  mv m3(1).lst qq
+  398  mv m3\(1\).lst CS25_Obj.txt
+  399  vi CS25_Obj.txt 
+  400  ps -ef|grep Fire
+  401  kill -9 1427
+  402  ps -ef|grep Fire
+  403  kill -913425
+  404  kill -9 13425
+  405  cd Downloads/
+  406  ls -ltr
+  407  unzip ORA445_20160115053622_COM_1.zip 
+  408  cd diag/rdbms/nadb14/NADB14-5/incident/
+  409  ls -ltr
+  410  cd incdir_514261
+  411  ls
+  412  vi *
+  413  pwd
+  414  cd
+  415  cd Downloads/
+  416  ls -ltr
+  417  vi ASH_Blocker_5.lst.gz 
+  418  pwd
+  419  ls -ltr
+  420  vi UNDO.log
+  421  cat UNDO.log |grep -v UNDO >UNDO_NA6.log
+  422  vi UNDO_NA6.log 
+  423  ps -ef|grep Fire
+  424  kill -9 10167
+  425  vi 1
+  426  vi 111
+  427  ps -ef|grep Fire
+  428  kill -9 1346
+  429  pwd
+  430  cd Downloads/
+  431  ls -l */SF_CON_PP*
+  432  ls -l */SFCON_PP*
+  433  ls -l SFCON*
+  434  vi SFCON_PPT_SF_CON_RAC.log 
+  435  ls -l Wal*
+  436  vi SF_CON_RAC*
+  437  ls -l *SF_CON*
+  438  ps -ef|grep Fire
+  439  kill -9 1390
+  440  vi *Wa*
+  441  top
+  442  ps -ef|grep Fire
+  443  kill -9 323
+  444  kill -9 13869
+  445  vi 4031
+  446  /Users/adas/Downloads/SFCon/SFConsole_LS ; exit;
+  447  /Users/adas/Downloads/SFCon/SFConsole_LS ; exit;
+  448  ps -ef|grep Fire
+  449  kill -9 244
+  450  kill -9 1892
+  451  sudo -u ntp.internal.salesforce.com
+  452  sudo ntpdate -u ntp.internal.salesforce.com
+  453  hostname
+  454  ps -ef|grep Fire
+  455  kill -9 945
+  456  git --version
+  457  git config --global user.email "adas@salesforce.com"
+  458  git config --global user.name "Amit Das"
+  459  vi /etc/gitconfig
+  460  where gitconfig
+  461  find / -name gitconfig
+  462  vi /usr/local/git/etc/gitconfig 
+  463  git config --list
+  464  git config --global core.editor emacs
+  465  git config --list
+  466  git config
+  467  git config --global
+  468  git config --l
+  469  git config --e
+  470  git config --edit
+  471  pwd
+  472  mkdir SFCon
+  473  ls
+  474  cd SFCon
+  475  git init
+  476  ls -l
+  477  ls -l .git
+  478  git status
+  479  touch Readme
+  480  ls 
+  481  ls -l
+  482  git status
+  483  git add Readme
+  484  git status
+  485  git commit
+  486  history
+  487  pwd
+  488  ls -l
+  489  vi Readme 
+  490  git --config
+  491  git --list
+  492  git --status
+  493  git config --global core.editor vim
+  494  git config --list
+  495  git init
+  496  ls -l
+  497  git status
+  498  git log
+  499  git init
+  500  git status
+  501  pwd
+  502  ls -l
+  503  cd SFCon/
+  504  fit init
+  505  git init
+  506  git status
+  507  git log
+  508  git add Readme 
+  509  git status
+  510  vi Readme 
+  511  ls -l
+  512  git add Readme 
+  513  ls -l
+  514  git add .
+  515  ls -l
+  516  git add Readme 
+  517  git edit Readme 
+  518  git edit init Readme 
+  519  git commit Readme 
+  520  git status
+  521  ls -l
+  522  git add Hello
+  523  git add Test
+  524  ls -l
+  525  git commit Readme 
+  526  touch Test
+  527  git add Test
+  528  git status
+  529  git commit Test 
+  530  git status
+  531  ls -l
+  532  git commit Test 
+  533  git add Test
+  534  git commit Test 
+  535  git status
+  536  ls -l
+  537  rm Test
+  538  ls -l
+  539  git status
+  540  git add Test
+  541  ls -l
+  542  git status
+  543  git commit Test
+  544  git status
+  545  ls -l
+  546  ls -la
+  547  ls -l .git
+  548  git logs
+  549  ls -l .git/branches/
+  550  ls -l .git/*/
+  551  ls -l .git/*/*/
+  552  touch f1
+  553  touch f2
+  554  mkdir Das
+  555  git status
+  556  mv f2 Das/
+  557  git status
+  558  git add Das
+  559  git status
+  560  git add f1
+  561  git commit -m "Testing" f1
+  562  git status
+  563  git diff
+  564  echo "Hello" >>f1
+  565  git status
+  566  git diff
+  567  git checkout f1
+  568  git diff
+  569  git status
+  570  git log
+  571  gitk
+  572  git log
+  573  git status
+  574  git reset HEAD f1
+  575  git status
+  576  git commit f1
+  577  git status
+  578  git commit -m "Test2" f1
+  579  git status
+  580  git commit -m "Test2" Das/f2
+  581  git status
+  582  git show
+  583  git status
+  584  git add .
+  585  git status
+  586  ls -l
+  587  cp ~/Downloads/SFCon_LS(5) .
+  588  cp ~/Downloads/SFCon_LS\(5\) .
+  589  ls -l
+  590  mv SFCon_LS\(5\) SFCon_old
+  591  git status
+  592  git commit -m "Old SFCon" SFCon_old 
+  593  git add SFCon_old 
+  594  git status
+  595  git commit -m "Old SFCon" SFCon_old 
+  596  git status
+  597  ls -l
+  598  vi SFCon_old 
+  599  git status
+  600  git commit -m "Old SFConi1" SFCon_old 
+  601  git status
+  602  git log
+  603  ls -l
+  604  rm SFCon_old 
+  605  git status
+  606  ls -l
+  607  git checkout -- SFCon_old
+  608  ls -l
+  609  git status
+  610  cp SFCon_old SFCol_1
+  611  git status
+  612  git add SFCol_1 
+  613  git status
+  614  git commit SFCol_1 
+  615  git status
+  616  git edit SFCol_1 
+  617  git init SFCol_1 
+  618  git status
+  619  touch g1,g2
+  620  ls -l
+  621  touch g1 g2
+  622  ls -l
+  623  git status
+  624  git rm g1,g2
+  625  git rm g1\,g2
+  626  git status
+  627  git rm g2
+  628  git add g1
+  629  git status
+  630  rm g1,g2
+  631  git status
+  632  git edit g1
+  633  git help
+  634  git commit g1
+  635  git status
+  636  vi g1
+  637  git status
+  638  git reset
+  639  git status
+  640  git reset --help
+  641  git reset g1
+  642  git status
+  643  vi g1
+  644  git diff
+  645  git log
+  646  git diff
+  647  git status
+  648  git checkout g1
+  649  git status
+  650  ls -l
+  651  vi g1
+  652  ls -l
+  653  git status
+  654  git commit -ammend
+  655  git status
+  656  ls -l
+  657  vi g1
+  658  ls -l
+  659  git status
+  660  git add g2
+  661  git status
+  662  git reset HEAD g2
+  663  git status
+  664  vi g2
+  665  git status
+  666  git reset HEAD g2
+  667  git status
+  668  vi g2
+  669  git add g2
+  670  git status
+  671  git status
+  672  git commit .
+  673  git status
+  674  git commit -m "Done" .
+  675  git status
+  676  git branch g2.1
+  677  git status
+  678  ls -l
+  679  git branch --help
+  680  git checkout -b g2.1
+  681  git checkout -b g2.2
+  682  ls -l
+  683  git commit
+  684  git status
+  685  git list
+  686  vi g2
+  687  git list
+  688  git status
+  689  git merge
+  690  git merge g2.2
+  691  git merge g2.1
+  692  git log
+  693  git status
+  694  git merge g2
+  695  git mcheckout master
+  696  git status
+  697  git checkout master
+  698  git status
+  699  vi g2
+  700  vi g2.1
+  701  git status
+  702  git bracnch --list
+  703  git bracnch -- list
+  704  git bracnch cat .git/HEAD
+  705  git bracnch cat .git/HEADS
+  706  ls -l .git
+  707  ls -l .git/HEAD
+  708  cat git checkout -b SFCol_1 SFCon_0613
+  709  git list
+  710  git commit -m "All done" .
+  711  git status
+  712  git add g2.1
+  713  git status
+  714  vi g2.1
+  715  git status
+  716  git branch -b g2.1_1
+  717  git branch 
+  718  git branch --list
+  719  git checkout g2.1
+  720  git branch 
+  721  vi g2.1
+  722  git branch 
+  723  git status
+  724  git checkout g2.2
+  725  git status
+  726  git branch 
+  727  vi g2
+  728  git branch 
+  729  git status
+  730  git commit
+  731  git branch 
+  732  git status
+  733  git add g2.2
+  734  git add g2
+  735  git status
+  736  git branch 
+  737  git branch 
+  738  git merge
+  739  git marge
+  740  git merge g2.2
+  741  git branch 
+  742  git status
+  743  git merge g2
+  744  git checkout g2.2
+  745  git merge g2
+  746  git merge g2.2
+  747  git status
+  748  git commit -b "Updte G2.2" .
+  749  git commit -b "Updte G2.2" g2
+  750  git commit -m "Updte G2.2" g2
+  751  git status
+  752  git branch 
+  753  git branch --merged
+  754  git branch 
+  755  git status
+  756  ls -l
+  757  rm g2.1
+  758  git status
+  759  git rm .
+  760  git rm  g2.1
+  761  git status
+  762  git commit -m "Delelt" .
+  763  git status
+  764  vi Master
+  765  git add Master 
+  766  git commit -m "1st one" Master 
+  767  ls -l
+  768  cat Master
+  769  git branch
+  770  git branch -d master
+  771  git branch -D master
+  772  git branch -D g2.2
+  773  git branch -D g2.1
+  774  git branch
+  775  git branch
+  776  git status
+  777  git checkout Master
+  778  git branch B1
+  779  git branch
+  780  git checkout B1
+  781  git branch
+  782  vi Master
+  783  vi Master
+  784  git branch
+  785  git status
+  786  git checkout Master
+  787  git merge B1
+  788  git status
+  789  git branch
+  790  git branch -b B2
+  791  git branch B2
+  792  git checkout B2
+  793  git branch
+  794  vi Master
+  795  git checkout Master
+  796  vi Master 
+  797  git checkout B2
+  798  vi Master 
+  799  git commit -m "Adding for B2" .
+  800  vi Master 
+  801  git checkout Master 
+  802  vi Master 
+  803  git branch B3
+  804  git checkout B3
+  805  git commit
+  806  vi Master 
+  807  git commit
+  808  git branch
+  809  vi Master 
+  810  git add 
+  811  git add .
+  812  git add Master
+  813  git commit
+  814  git checkout Master 
+  815  git status
+  816  git branch B4
+  817  git checkout b4
+  818  vi Master
+  819  git add Master 
+  820  get checkout B3
+  821  git checkout B3
+  822  vi Master
+  823  git status
+  824  git checkout Master
+  825  git merge B2
+  826  vi Master
+  827  git status
+  828  git status
+  829  git branche
+  830  git branch
+  831  git commit 
+  832  git status
+  833  vi Master
+  834  git checkout B1
+  835  vi Master 
+  836  git status
+  837  git add Master
+  838  git status
+  839  git commit Master 
+  840  git status
+  841  vi Master 
+  842  git checkout B4
+  843  vi Master 
+  844  git status
+  845  ls -l 
+  846  git checkout Master 
+  847  vi Master
+  848  git brunch M1
+  849  git brunche M1
+  850  git branch M1
+  851  git checkout M1
+  852  git branch
+  853  vi Master
+  854  git add .
+  855  git branch
+  856  git status
+  857  git checkout Master 
+  858  vi Master
+  859  git checkout M1
+  860  git commit .
+  861  git checkout Master 
+  862  vi Master
+  863  get branch
+  864  git branch
+  865  git add
+  866  git add .
+  867  git commit .
+  868  git checkout Master 
+  869  git branch M2
+  870  git checkout M2
+  871  vi Master
+  872  git brunch
+  873  git branch
+  874  git add .
+  875  git commit .
+  876  git status
+  877  git checkout Master 
+  878  vi Master
+  879  git merge M1
+  880  git merge M2
+  881  vi Master 
+  882  git merge M1
+  883  git branch
+  884  git checkout Master 
+  885  git branch
+  886  history >gitcommand
