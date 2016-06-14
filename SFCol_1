@@ -18,7 +18,7 @@
 #db flash cache dynamic disabling wait
 # physical read flash cache hits
 # flash cache inserts    info      
-# flash cache insert skip: exists
+# flash cache insert skip: exists yep
 # flash cache insert skip: not useful
 # flash cache insert skip: modification 
 
